@@ -18,18 +18,17 @@ import (
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/opts"
-	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/system"
-	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 	dockerarchive "github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/util/tracing/detect"
 	"github.com/pkg/errors"
 )
 
@@ -56,6 +55,7 @@ type Driver struct {
 	cgroupParent  string
 	restartPolicy container.RestartPolicy
 	env           []string
+	defaultLoad   bool
 }
 
 func (d *Driver) IsMobyDriver() bool {
@@ -70,13 +70,13 @@ func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 	return progress.Wrap("[internal] booting buildkit", l, func(sub progress.SubLogger) error {
 		_, err := d.DockerAPI.ContainerInspect(ctx, d.Name)
 		if err != nil {
-			if dockerclient.IsErrNotFound(err) {
+			if errdefs.IsNotFound(err) {
 				return d.create(ctx, sub)
 			}
 			return err
 		}
 		return sub.Wrap("starting container "+d.Name, func() error {
-			if err := d.start(ctx, sub); err != nil {
+			if err := d.start(ctx); err != nil {
 				return err
 			}
 			return d.wait(ctx, sub)
@@ -95,19 +95,20 @@ func (d *Driver) create(ctx context.Context, l progress.SubLogger) error {
 		if err != nil {
 			return err
 		}
-		rc, err := d.DockerAPI.ImageCreate(ctx, imageName, dockertypes.ImageCreateOptions{
+		resp, err := d.DockerAPI.ImageCreate(ctx, imageName, image.CreateOptions{
 			RegistryAuth: ra,
 		})
 		if err != nil {
 			return err
 		}
-		_, err = io.Copy(io.Discard, rc)
-		return err
+		defer resp.Close()
+		return jsonmessage.DisplayJSONMessagesStream(resp, io.Discard, 0, false, nil)
 	}); err != nil {
 		// image pulling failed, check if it exists in local image store.
 		// if not, return pulling error. otherwise log it.
-		_, _, errInspect := d.DockerAPI.ImageInspectWithRaw(ctx, imageName)
-		if errInspect != nil {
+		_, errInspect := d.DockerAPI.ImageInspect(ctx, imageName)
+		found := errInspect == nil
+		if !found {
 			return err
 		}
 		l.Wrap("pulling failed, using local image "+imageName, func() error { return nil })
@@ -177,7 +178,6 @@ func (d *Driver) create(ctx context.Context, l progress.SubLogger) error {
 					break
 				}
 			}
-
 		}
 		_, err := d.DockerAPI.ContainerCreate(ctx, cfg, hc, &network.NetworkingConfig{}, nil, d.Name)
 		if err != nil && !errdefs.IsConflict(err) {
@@ -187,7 +187,7 @@ func (d *Driver) create(ctx context.Context, l progress.SubLogger) error {
 			if err := d.copyToContainer(ctx, d.InitConfig.Files); err != nil {
 				return err
 			}
-			if err := d.start(ctx, l); err != nil {
+			if err := d.start(ctx); err != nil {
 				return err
 			}
 		}
@@ -202,20 +202,18 @@ func (d *Driver) wait(ctx context.Context, l progress.SubLogger) error {
 		bufStderr := &bytes.Buffer{}
 		if err := d.run(ctx, []string{"buildctl", "debug", "workers"}, bufStdout, bufStderr); err != nil {
 			if try > 15 {
-				if err != nil {
-					d.copyLogs(context.TODO(), l)
-					if bufStdout.Len() != 0 {
-						l.Log(1, bufStdout.Bytes())
-					}
-					if bufStderr.Len() != 0 {
-						l.Log(2, bufStderr.Bytes())
-					}
+				d.copyLogs(context.TODO(), l)
+				if bufStdout.Len() != 0 {
+					l.Log(1, bufStdout.Bytes())
+				}
+				if bufStderr.Len() != 0 {
+					l.Log(2, bufStderr.Bytes())
 				}
 				return err
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			case <-time.After(time.Duration(try*120) * time.Millisecond):
 				try++
 				continue
@@ -257,17 +255,16 @@ func (d *Driver) copyToContainer(ctx context.Context, files map[string][]byte) e
 	defer srcArchive.Close()
 
 	baseDir := path.Dir(confutil.DefaultBuildKitConfigDir)
-	return d.DockerAPI.CopyToContainer(ctx, d.Name, baseDir, srcArchive, dockertypes.CopyToContainerOptions{})
+	return d.DockerAPI.CopyToContainer(ctx, d.Name, baseDir, srcArchive, container.CopyToContainerOptions{})
 }
 
 func (d *Driver) exec(ctx context.Context, cmd []string) (string, net.Conn, error) {
-	execConfig := dockertypes.ExecConfig{
+	response, err := d.DockerAPI.ContainerExecCreate(ctx, d.Name, container.ExecOptions{
 		Cmd:          cmd,
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
-	}
-	response, err := d.DockerAPI.ContainerExecCreate(ctx, d.Name, execConfig)
+	})
 	if err != nil {
 		return "", nil, err
 	}
@@ -277,7 +274,7 @@ func (d *Driver) exec(ctx context.Context, cmd []string) (string, net.Conn, erro
 		return "", nil, errors.New("exec ID empty")
 	}
 
-	resp, err := d.DockerAPI.ContainerExecAttach(ctx, execID, dockertypes.ExecStartCheck{})
+	resp, err := d.DockerAPI.ContainerExecAttach(ctx, execID, container.ExecStartOptions{})
 	if err != nil {
 		return "", nil, err
 	}
@@ -303,14 +300,14 @@ func (d *Driver) run(ctx context.Context, cmd []string, stdout, stderr io.Writer
 	return nil
 }
 
-func (d *Driver) start(ctx context.Context, l progress.SubLogger) error {
+func (d *Driver) start(ctx context.Context) error {
 	return d.DockerAPI.ContainerStart(ctx, d.Name, container.StartOptions{})
 }
 
 func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
 	ctn, err := d.DockerAPI.ContainerInspect(ctx, d.Name)
 	if err != nil {
-		if dockerclient.IsErrNotFound(err) {
+		if errdefs.IsNotFound(err) {
 			return &driver.Info{
 				Status: driver.Inactive,
 			}, nil
@@ -395,28 +392,21 @@ func (d *Driver) Dial(ctx context.Context) (net.Conn, error) {
 	return conn, nil
 }
 
-func (d *Driver) Client(ctx context.Context) (*client.Client, error) {
+func (d *Driver) Client(ctx context.Context, opts ...client.ClientOpt) (*client.Client, error) {
 	conn, err := d.Dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	exp, _, err := detect.Exporter()
-	if err != nil {
-		return nil, err
-	}
-
-	var opts []client.ClientOpt
 	var counter int64
-	opts = append(opts, client.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-		if atomic.AddInt64(&counter, 1) > 1 {
-			return nil, net.ErrClosed
-		}
-		return conn, nil
-	}))
-	if td, ok := exp.(client.TracerDelegate); ok {
-		opts = append(opts, client.WithTracerDelegate(td))
-	}
+	opts = append([]client.ClientOpt{
+		client.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			if atomic.AddInt64(&counter, 1) > 1 {
+				return nil, net.ErrClosed
+			}
+			return conn, nil
+		}),
+	}, opts...)
 	return client.New(ctx, "", opts...)
 }
 
@@ -430,6 +420,7 @@ func (d *Driver) Features(ctx context.Context) map[driver.Feature]bool {
 		driver.DockerExporter: true,
 		driver.CacheExport:    true,
 		driver.MultiPlatform:  true,
+		driver.DefaultLoad:    d.defaultLoad,
 	}
 }
 
@@ -494,7 +485,7 @@ func writeConfigFiles(m map[string][]byte) (_ string, err error) {
 }
 
 func getBuildkitFlags(initConfig driver.InitConfig) []string {
-	flags := initConfig.BuildkitFlags
+	flags := initConfig.BuildkitdFlags
 	if _, ok := initConfig.Files[buildkitdConfigFile]; ok {
 		// There's no way for us to determine the appropriate default configuration
 		// path and the default path can vary depending on if the image is normal

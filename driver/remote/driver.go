@@ -7,12 +7,15 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/buildx/driver"
+	util "github.com/docker/buildx/driver/remote/util"
 	"github.com/docker/buildx/util/progress"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/util/tracing/detect"
+	"github.com/moby/buildkit/client/connhelper"
+	"github.com/moby/buildkit/util/tracing/delegated"
 	"github.com/pkg/errors"
 )
 
@@ -23,6 +26,12 @@ type Driver struct {
 	// if you add fields, remember to update docs:
 	// https://github.com/docker/docs/blob/main/content/build/drivers/remote.md
 	*tlsOpts
+	defaultLoad bool
+
+	// remote driver caches the client because its Bootstap/Info methods reuse it internally
+	clientOnce sync.Once
+	client     *client.Client
+	err        error
 }
 
 type tlsOpts struct {
@@ -38,8 +47,9 @@ func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 		return err
 	}
 	return progress.Wrap("[internal] waiting for connection", l, func(_ progress.SubLogger) error {
-		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
+		cancelCtx, cancel := context.WithCancelCause(ctx)
+		ctx, _ := context.WithTimeoutCause(cancelCtx, 20*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet,lostcancel // no need to manually cancel this context as we already rely on parent
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
 		return c.Wait(ctx)
 	})
 }
@@ -75,33 +85,38 @@ func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
 	return nil
 }
 
-func (d *Driver) Client(ctx context.Context) (*client.Client, error) {
-	opts := []client.ClientOpt{}
-
-	exp, _, err := detect.Exporter()
-	if err != nil {
-		return nil, err
-	}
-	if td, ok := exp.(client.TracerDelegate); ok {
-		opts = append(opts, client.WithTracerDelegate(td))
-	}
-
-	opts = append(opts, client.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-		return d.Dial(ctx)
-	}))
-
-	return client.New(ctx, "", opts...)
+func (d *Driver) Client(ctx context.Context, opts ...client.ClientOpt) (*client.Client, error) {
+	d.clientOnce.Do(func() {
+		opts = append([]client.ClientOpt{
+			client.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				return d.Dial(ctx)
+			}),
+			client.WithTracerDelegate(delegated.DefaultExporter),
+		}, opts...)
+		c, err := client.New(ctx, "", opts...)
+		d.client = c
+		d.err = err
+	})
+	return d.client, d.err
 }
 
 func (d *Driver) Dial(ctx context.Context) (net.Conn, error) {
-	network, addr, ok := strings.Cut(d.InitConfig.EndpointAddr, "://")
+	addr := d.InitConfig.EndpointAddr
+	ch, err := connhelper.GetConnectionHelper(addr)
+	if err != nil {
+		return nil, err
+	}
+	if ch != nil {
+		return ch.ContextDialer(ctx, addr)
+	}
+
+	network, addr, ok := strings.Cut(addr, "://")
 	if !ok {
 		return nil, errors.Errorf("invalid endpoint address: %s", d.InitConfig.EndpointAddr)
 	}
 
-	dialer := &net.Dialer{}
+	conn, err := util.DialContext(ctx, network, addr)
 
-	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -149,6 +164,7 @@ func (d *Driver) Features(ctx context.Context) map[driver.Feature]bool {
 		driver.DockerExporter: true,
 		driver.CacheExport:    true,
 		driver.MultiPlatform:  true,
+		driver.DefaultLoad:    d.defaultLoad,
 	}
 }
 

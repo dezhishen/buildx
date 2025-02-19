@@ -28,8 +28,12 @@ const (
 )
 
 func runRm(ctx context.Context, dockerCli command.Cli, in rmOptions) error {
-	if in.allInactive && !in.force && !command.PromptForConfirmation(dockerCli.In(), dockerCli.Out(), rmInactiveWarning) {
-		return nil
+	if in.allInactive && !in.force {
+		if ok, err := prompt(ctx, dockerCli.In(), dockerCli.Out(), rmInactiveWarning); err != nil {
+			return err
+		} else if !ok {
+			return nil
+		}
 	}
 
 	txn, release, err := storeutil.GetStore(dockerCli)
@@ -112,7 +116,7 @@ func rmCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 
 	flags := cmd.Flags()
 	flags.BoolVar(&options.keepState, "keep-state", false, "Keep BuildKit state")
-	flags.BoolVar(&options.keepDaemon, "keep-daemon", false, "Keep the buildkitd daemon running")
+	flags.BoolVar(&options.keepDaemon, "keep-daemon", false, "Keep the BuildKit daemon running")
 	flags.BoolVar(&options.allInactive, "all-inactive", false, "Remove all inactive builders")
 	flags.BoolVarP(&options.force, "force", "f", false, "Do not prompt for confirmation")
 
@@ -146,8 +150,9 @@ func rmAllInactive(ctx context.Context, txn *store.Txn, dockerCli command.Cli, i
 		return err
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
+	timeoutCtx, cancel := context.WithCancelCause(ctx)
+	timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 20*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet,lostcancel // no need to manually cancel this context as we already rely on parent
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	eg, _ := errgroup.WithContext(timeoutCtx)
 	for _, b := range builders {

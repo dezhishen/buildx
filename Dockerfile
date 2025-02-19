@@ -1,17 +1,27 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.21.6
-ARG XX_VERSION=1.4.0
+ARG GO_VERSION=1.23
+ARG ALPINE_VERSION=3.21
+ARG XX_VERSION=1.6.1
 
-ARG DOCKER_VERSION=25.0.2
-ARG GOTESTSUM_VERSION=v1.9.0
-ARG REGISTRY_VERSION=2.8.0
-ARG BUILDKIT_VERSION=v0.12.5
+# for testing
+ARG DOCKER_VERSION=28.0.0-rc.1
+ARG DOCKER_VERSION_ALT_26=26.1.3
+ARG DOCKER_CLI_VERSION=${DOCKER_VERSION}
+ARG GOTESTSUM_VERSION=v1.12.0
+ARG REGISTRY_VERSION=2.8.3
+ARG BUILDKIT_VERSION=v0.19.0
+ARG UNDOCK_VERSION=0.9.0
 
-# xx is a helper for cross-compilation
 FROM --platform=$BUILDPLATFORM tonistiigi/xx:${XX_VERSION} AS xx
-
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS golatest
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS golatest
+FROM moby/moby-bin:$DOCKER_VERSION AS docker-engine
+FROM dockereng/cli-bin:$DOCKER_CLI_VERSION AS docker-cli
+FROM moby/moby-bin:$DOCKER_VERSION_ALT_26 AS docker-engine-alt
+FROM dockereng/cli-bin:$DOCKER_VERSION_ALT_26 AS docker-cli-alt
+FROM registry:$REGISTRY_VERSION AS registry
+FROM moby/buildkit:$BUILDKIT_VERSION AS buildkit
+FROM crazymax/undock:$UNDOCK_VERSION AS undock
 
 FROM golatest AS gobase
 COPY --from=xx / /
@@ -20,32 +30,38 @@ ENV GOFLAGS=-mod=vendor
 ENV CGO_ENABLED=0
 WORKDIR /src
 
-FROM registry:$REGISTRY_VERSION AS registry
-
-FROM moby/buildkit:$BUILDKIT_VERSION AS buildkit
-
-FROM gobase AS docker
-ARG TARGETPLATFORM
-ARG DOCKER_VERSION
-WORKDIR /opt/docker
-RUN DOCKER_ARCH=$(case ${TARGETPLATFORM:-linux/amd64} in \
-    "linux/amd64")   echo "x86_64"  ;; \
-    "linux/arm/v6")  echo "armel"   ;; \
-    "linux/arm/v7")  echo "armhf"   ;; \
-    "linux/arm64")   echo "aarch64" ;; \
-    "linux/ppc64le") echo "ppc64le" ;; \
-    "linux/s390x")   echo "s390x"   ;; \
-    *)               echo ""        ;; esac) \
-  && echo "DOCKER_ARCH=$DOCKER_ARCH" \
-  && wget -qO- "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_VERSION}.tgz" | tar xvz --strip 1
-RUN ./dockerd --version && ./containerd --version && ./ctr --version && ./runc --version
-
 FROM gobase AS gotestsum
 ARG GOTESTSUM_VERSION
-ENV GOFLAGS=
-RUN --mount=target=/root/.cache,type=cache \
-  GOBIN=/out/ go install "gotest.tools/gotestsum@${GOTESTSUM_VERSION}" && \
-  /out/gotestsum --version
+ENV GOFLAGS=""
+RUN --mount=target=/root/.cache,type=cache <<EOT
+  set -ex
+  go install "gotest.tools/gotestsum@${GOTESTSUM_VERSION}"
+  go install "github.com/wadey/gocovmerge@latest"
+  mkdir /out
+  /go/bin/gotestsum --version
+  mv /go/bin/gotestsum /out
+  mv /go/bin/gocovmerge /out
+EOT
+COPY --chmod=755 <<"EOF" /out/gotestsumandcover
+#!/bin/sh
+set -x
+if [ -z "$GO_TEST_COVERPROFILE" ]; then
+  exec gotestsum "$@"
+fi
+coverdir="$(dirname "$GO_TEST_COVERPROFILE")"
+mkdir -p "$coverdir/helpers"
+gotestsum "$@" "-coverprofile=$GO_TEST_COVERPROFILE"
+ecode=$?
+go tool covdata textfmt -i=$coverdir/helpers -o=$coverdir/helpers-report.txt
+gocovmerge "$coverdir/helpers-report.txt" "$GO_TEST_COVERPROFILE" > "$coverdir/merged-report.txt"
+mv "$coverdir/merged-report.txt" "$GO_TEST_COVERPROFILE"
+rm "$coverdir/helpers-report.txt"
+for f in "$coverdir/helpers"/*; do
+  rm "$f"
+done
+rmdir "$coverdir/helpers"
+exit $ecode
+EOF
 
 FROM gobase AS buildx-version
 RUN --mount=type=bind,target=. <<EOT
@@ -57,6 +73,7 @@ EOT
 
 FROM gobase AS buildx-build
 ARG TARGETPLATFORM
+ARG GO_EXTRA_FLAGS
 RUN --mount=type=bind,target=. \
   --mount=type=cache,target=/root/.cache \
   --mount=type=cache,target=/go/pkg/mod \
@@ -64,6 +81,7 @@ RUN --mount=type=bind,target=. \
   set -e
   xx-go --wrap
   DESTDIR=/usr/bin VERSION=$(cat /buildx-version/version) REVISION=$(cat /buildx-version/revision) GO_EXTRA_LDFLAGS="-s -w" ./hack/build
+  file /usr/bin/docker-buildx
   xx-verify --static /usr/bin/docker-buildx
 EOT
 
@@ -82,7 +100,9 @@ FROM scratch AS binaries-unix
 COPY --link --from=buildx-build /usr/bin/docker-buildx /buildx
 
 FROM binaries-unix AS binaries-darwin
+FROM binaries-unix AS binaries-freebsd
 FROM binaries-unix AS binaries-linux
+FROM binaries-unix AS binaries-openbsd
 
 FROM scratch AS binaries-windows
 COPY --link --from=buildx-build /usr/bin/docker-buildx /buildx.exe
@@ -103,18 +123,23 @@ RUN apk add --no-cache \
       shadow-uidmap \
       xfsprogs \
       xz
-COPY --link --from=gotestsum /out/gotestsum /usr/bin/
+COPY --link --from=gotestsum /out /usr/bin/
 COPY --link --from=registry /bin/registry /usr/bin/
-COPY --link --from=docker /opt/docker/* /usr/bin/
+COPY --link --from=docker-engine / /usr/bin/
+COPY --link --from=docker-cli / /usr/bin/
+COPY --link --from=docker-engine-alt / /opt/docker-alt-26/
+COPY --link --from=docker-cli-alt / /opt/docker-alt-26/
 COPY --link --from=buildkit /usr/bin/buildkitd /usr/bin/
 COPY --link --from=buildkit /usr/bin/buildctl /usr/bin/
+COPY --link --from=undock /usr/local/bin/undock /usr/bin/
 COPY --link --from=binaries /buildx /usr/bin/
+ENV TEST_DOCKER_EXTRA="docker@26.1=/opt/docker-alt-26"
 
 FROM integration-test-base AS integration-test
 COPY . .
 
 # Release
-FROM --platform=$BUILDPLATFORM alpine AS releaser
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS releaser
 WORKDIR /work
 ARG TARGETPLATFORM
 RUN --mount=from=binaries \
@@ -129,7 +154,7 @@ COPY --from=releaser /out/ /
 
 # Shell
 FROM docker:$DOCKER_VERSION AS dockerd-release
-FROM alpine AS shell
+FROM alpine:${ALPINE_VERSION} AS shell
 RUN apk add --no-cache iptables tmux git vim less openssh
 RUN mkdir -p /usr/local/lib/docker/cli-plugins && ln -s /usr/local/bin/buildx /usr/local/lib/docker/cli-plugins/docker-buildx
 COPY ./hack/demo-env/entrypoint.sh /usr/local/bin

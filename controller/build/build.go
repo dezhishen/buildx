@@ -3,7 +3,6 @@ package build
 import (
 	"context"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,9 +18,8 @@ import (
 	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/cli/cli/config"
 	dockeropts "github.com/docker/cli/opts"
-	"github.com/docker/go-units"
+	"github.com/docker/docker/api/types/container"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/util/grpcerrors"
@@ -36,9 +34,9 @@ const defaultTargetName = "default"
 // NOTE: When an error happens during the build and this function acquires the debuggable *build.ResultHandle,
 // this function returns it in addition to the error (i.e. it does "return nil, res, err"). The caller can
 // inspect the result and debug the cause of that error.
-func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.BuildOptions, inStream io.Reader, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
+func RunBuild(ctx context.Context, dockerCli command.Cli, in *controllerapi.BuildOptions, inStream io.Reader, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, *build.Inputs, error) {
 	if in.NoCache && len(in.NoCacheFilter) > 0 {
-		return nil, nil, errors.Errorf("--no-cache and --no-cache-filter cannot currently be used together")
+		return nil, nil, nil, errors.Errorf("--no-cache and --no-cache-filter cannot currently be used together")
 	}
 
 	contexts := map[string]build.NamedContext{}
@@ -50,37 +48,40 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 		Inputs: build.Inputs{
 			ContextPath:    in.ContextPath,
 			DockerfilePath: in.DockerfileName,
-			InStream:       inStream,
+			InStream:       build.NewSyncMultiReader(inStream),
 			NamedContexts:  contexts,
 		},
-		Ref:           in.Ref,
-		BuildArgs:     in.BuildArgs,
-		CgroupParent:  in.CgroupParent,
-		ExtraHosts:    in.ExtraHosts,
-		Labels:        in.Labels,
-		NetworkMode:   in.NetworkMode,
-		NoCache:       in.NoCache,
-		NoCacheFilter: in.NoCacheFilter,
-		Pull:          in.Pull,
-		ShmSize:       dockeropts.MemBytes(in.ShmSize),
-		Tags:          in.Tags,
-		Target:        in.Target,
-		Ulimits:       controllerUlimitOpt2DockerUlimit(in.Ulimits),
-		GroupRef:      in.GroupRef,
+		Ref:                    in.Ref,
+		BuildArgs:              in.BuildArgs,
+		CgroupParent:           in.CgroupParent,
+		ExtraHosts:             in.ExtraHosts,
+		Labels:                 in.Labels,
+		NetworkMode:            in.NetworkMode,
+		NoCache:                in.NoCache,
+		NoCacheFilter:          in.NoCacheFilter,
+		Pull:                   in.Pull,
+		ShmSize:                dockeropts.MemBytes(in.ShmSize),
+		Tags:                   in.Tags,
+		Target:                 in.Target,
+		Ulimits:                controllerUlimitOpt2DockerUlimit(in.Ulimits),
+		GroupRef:               in.GroupRef,
+		ProvenanceResponseMode: confutil.ParseMetadataProvenance(in.ProvenanceResponseMode),
 	}
 
 	platforms, err := platformutil.Parse(in.Platforms)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	opts.Platforms = platforms
 
-	dockerConfig := config.LoadDefaultConfigFile(os.Stderr)
-	opts.Session = append(opts.Session, authprovider.NewDockerAuthProvider(dockerConfig, nil))
+	dockerConfig := dockerCli.ConfigFile()
+	opts.Session = append(opts.Session, authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{
+		ConfigFile: dockerConfig,
+	}))
 
 	secrets, err := controllerapi.CreateSecrets(in.Secrets)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	opts.Session = append(opts.Session, secrets)
 
@@ -90,53 +91,54 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 	}
 	ssh, err := controllerapi.CreateSSH(sshSpecs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	opts.Session = append(opts.Session, ssh)
 
-	outputs, err := controllerapi.CreateExports(in.Exports)
+	outputs, _, err := controllerapi.CreateExports(in.Exports)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if in.ExportPush {
-		if in.ExportLoad {
-			return nil, nil, errors.Errorf("push and load may not be set together at the moment")
+		var pushUsed bool
+		for i := range outputs {
+			if outputs[i].Type == client.ExporterImage {
+				outputs[i].Attrs["push"] = "true"
+				pushUsed = true
+			}
 		}
-		if len(outputs) == 0 {
-			outputs = []client.ExportEntry{{
-				Type: "image",
+		if !pushUsed {
+			outputs = append(outputs, client.ExportEntry{
+				Type: client.ExporterImage,
 				Attrs: map[string]string{
 					"push": "true",
 				},
-			}}
-		} else {
-			switch outputs[0].Type {
-			case "image":
-				outputs[0].Attrs["push"] = "true"
-			default:
-				return nil, nil, errors.Errorf("push and %q output can't be used together", outputs[0].Type)
-			}
+			})
 		}
 	}
 	if in.ExportLoad {
-		if len(outputs) == 0 {
-			outputs = []client.ExportEntry{{
-				Type:  "docker",
-				Attrs: map[string]string{},
-			}}
-		} else {
-			switch outputs[0].Type {
-			case "docker":
-			default:
-				return nil, nil, errors.Errorf("load and %q output can't be used together", outputs[0].Type)
+		var loadUsed bool
+		for i := range outputs {
+			if outputs[i].Type == client.ExporterDocker {
+				if _, ok := outputs[i].Attrs["dest"]; !ok {
+					loadUsed = true
+					break
+				}
 			}
+		}
+		if !loadUsed {
+			outputs = append(outputs, client.ExportEntry{
+				Type:  client.ExporterDocker,
+				Attrs: map[string]string{},
+			})
 		}
 	}
 
 	annotations, err := buildflags.ParseAnnotations(in.Annotations)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, errors.Wrap(err, "parse annotations")
 	}
+
 	for _, o := range outputs {
 		for k, v := range annotations {
 			o.Attrs[k.String()] = v
@@ -154,14 +156,15 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 
 	allow, err := buildflags.ParseEntitlements(in.Allow)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	opts.Allow = allow
 
-	if in.PrintFunc != nil {
-		opts.PrintFunc = &build.PrintFunc{
-			Name:   in.PrintFunc.Name,
-			Format: in.PrintFunc.Format,
+	if in.CallFunc != nil {
+		opts.CallFunc = &build.CallFunc{
+			Name:         in.CallFunc.Name,
+			Format:       in.CallFunc.Format,
+			IgnoreStatus: in.CallFunc.IgnoreStatus,
 		}
 	}
 
@@ -177,23 +180,28 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 		builder.WithContextPathHash(contextPathHash),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err = updateLastActivity(dockerCli, b.NodeGroup); err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to update builder last activity time")
+		return nil, nil, nil, errors.Wrapf(err, "failed to update builder last activity time")
 	}
 	nodes, err := b.LoadNodes(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	resp, res, err := buildTargets(ctx, dockerCli, b.NodeGroup, nodes, map[string]build.Options{defaultTargetName: opts}, progress, generateResult)
+	var inputs *build.Inputs
+	buildOptions := map[string]build.Options{defaultTargetName: opts}
+	resp, res, err := buildTargets(ctx, dockerCli, nodes, buildOptions, progress, generateResult)
 	err = wrapBuildError(err, false)
 	if err != nil {
 		// NOTE: buildTargets can return *build.ResultHandle even on error.
-		return nil, res, err
+		return nil, res, nil, err
 	}
-	return resp, res, nil
+	if i, ok := buildOptions[defaultTargetName]; ok {
+		inputs = &i.Inputs
+	}
+	return resp, res, inputs, nil
 }
 
 // buildTargets runs the specified build and returns the result.
@@ -201,14 +209,14 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 // NOTE: When an error happens during the build and this function acquires the debuggable *build.ResultHandle,
 // this function returns it in addition to the error (i.e. it does "return nil, res, err"). The caller can
 // inspect the result and debug the cause of that error.
-func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGroup, nodes []builder.Node, opts map[string]build.Options, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
+func buildTargets(ctx context.Context, dockerCli command.Cli, nodes []builder.Node, opts map[string]build.Options, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
 	var res *build.ResultHandle
 	var resp map[string]*client.SolveResponse
 	var err error
 	if generateResult {
 		var mu sync.Mutex
 		var idx int
-		resp, err = build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.ConfigDir(dockerCli), progress, func(driverIndex int, gotRes *build.ResultHandle) {
+		resp, err = build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress, func(driverIndex int, gotRes *build.ResultHandle) {
 			mu.Lock()
 			defer mu.Unlock()
 			if res == nil || driverIndex < idx {
@@ -216,7 +224,7 @@ func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGrou
 			}
 		})
 	} else {
-		resp, err = build.Build(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.ConfigDir(dockerCli), progress)
+		resp, err = build.Build(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress)
 	}
 	if err != nil {
 		return nil, res, err
@@ -268,9 +276,9 @@ func controllerUlimitOpt2DockerUlimit(u *controllerapi.UlimitOpt) *dockeropts.Ul
 	if u == nil {
 		return nil
 	}
-	values := make(map[string]*units.Ulimit)
+	values := make(map[string]*container.Ulimit)
 	for k, v := range u.Values {
-		values[k] = &units.Ulimit{
+		values[k] = &container.Ulimit{
 			Name: v.Name,
 			Hard: v.Hard,
 			Soft: v.Soft,
