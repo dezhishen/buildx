@@ -7,23 +7,28 @@ import (
 
 	"github.com/containerd/console"
 	"github.com/docker/buildx/util/logutil"
+	"github.com/mitchellh/hashstructure/v2"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type Printer struct {
 	status chan *client.SolveStatus
 
-	ready  chan struct{}
-	done   chan struct{}
-	paused chan struct{}
+	ready     chan struct{}
+	done      chan struct{}
+	paused    chan struct{}
+	closeOnce sync.Once
 
 	err          error
 	warnings     []client.VertexWarning
 	logMu        sync.Mutex
 	logSourceMap map[digest.Digest]interface{}
+	metrics      *metricWriter
 
 	// TODO: remove once we can use result context to pass build ref
 	//  see https://github.com/docker/buildx/pull/1861
@@ -32,9 +37,20 @@ type Printer struct {
 }
 
 func (p *Printer) Wait() error {
-	close(p.status)
-	<-p.done
+	p.closeOnce.Do(func() {
+		close(p.status)
+		<-p.done
+	})
 	return p.err
+}
+
+func (p *Printer) IsDone() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Printer) Pause() error {
@@ -49,10 +65,13 @@ func (p *Printer) Unpause() {
 
 func (p *Printer) Write(s *client.SolveStatus) {
 	p.status <- s
+	if p.metrics != nil {
+		p.metrics.Write(s)
+	}
 }
 
 func (p *Printer) Warnings() []client.VertexWarning {
-	return p.warnings
+	return dedupWarnings(p.warnings)
 }
 
 func (p *Printer) ValidateLogSource(dgst digest.Digest, v interface{}) bool {
@@ -96,12 +115,14 @@ func NewPrinter(ctx context.Context, out console.File, mode progressui.DisplayMo
 	}
 
 	pw := &Printer{
-		ready: make(chan struct{}),
+		ready:   make(chan struct{}),
+		metrics: opt.mw,
 	}
 	go func() {
 		for {
 			pw.status = make(chan *client.SolveStatus)
 			pw.done = make(chan struct{})
+			pw.closeOnce = sync.Once{}
 
 			pw.logMu.Lock()
 			pw.logSourceMap = map[digest.Digest]interface{}{}
@@ -147,6 +168,7 @@ func (p *Printer) BuildRefs() map[string]string {
 
 type printerOpts struct {
 	displayOpts []progressui.DisplayOpt
+	mw          *metricWriter
 
 	onclose func()
 }
@@ -165,8 +187,37 @@ func WithDesc(text string, console string) PrinterOpt {
 	}
 }
 
+func WithMetrics(mp metric.MeterProvider, attrs attribute.Set) PrinterOpt {
+	return func(opt *printerOpts) {
+		opt.mw = newMetrics(mp, attrs)
+	}
+}
+
 func WithOnClose(onclose func()) PrinterOpt {
 	return func(opt *printerOpts) {
 		opt.onclose = onclose
 	}
+}
+
+func dedupWarnings(inp []client.VertexWarning) []client.VertexWarning {
+	m := make(map[uint64]client.VertexWarning)
+	for _, w := range inp {
+		wcp := w
+		wcp.Vertex = ""
+		if wcp.SourceInfo != nil {
+			wcp.SourceInfo.Definition = nil
+		}
+		h, err := hashstructure.Hash(wcp, hashstructure.FormatV2, nil)
+		if err != nil {
+			continue
+		}
+		if _, ok := m[h]; !ok {
+			m[h] = w
+		}
+	}
+	res := make([]client.VertexWarning, 0, len(m))
+	for _, w := range m {
+		res = append(res, w)
+	}
+	return res
 }

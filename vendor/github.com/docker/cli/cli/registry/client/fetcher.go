@@ -270,7 +270,7 @@ func (c *client) iterateEndpoints(ctx context.Context, namedRef reference.Named,
 	return newNotFoundError(namedRef.String())
 }
 
-// allEndpoints returns a list of endpoints ordered by priority (v2, https, v1).
+// allEndpoints returns a list of endpoints ordered by priority (v2, http).
 func allEndpoints(namedRef reference.Named, insecure bool) ([]registry.APIEndpoint, error) {
 	repoInfo, err := registry.ParseRepositoryInfo(namedRef)
 	if err != nil {
@@ -304,4 +304,4 @@ func (n *notFoundError) Error() string {
 }
 
 // NotFound satisfies interface github.com/docker/docker/errdefs.ErrNotFound
-func (n *notFoundError) NotFound() {}
+func (notFoundError) NotFound() {}

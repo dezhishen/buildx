@@ -22,6 +22,10 @@ func getBuildkitdAddr(tmpdir string) string {
 	return "npipe:////./pipe/buildkitd-" + filepath.Base(tmpdir)
 }
 
+func getBuildkitdDebugAddr(tmpdir string) string {
+	return "npipe:////./pipe/buildkitd-debug-" + filepath.Base(tmpdir)
+}
+
 func getTraceSocketPath(tmpdir string) string {
 	return `\\.\pipe\buildkit-otel-grpc-` + filepath.Base(tmpdir)
 }
@@ -35,11 +39,11 @@ func getContainerdDebugSock(tmpdir string) string {
 }
 
 // no-op for parity with unix
-func mountInfo(tmpdir string) error {
+func mountInfo(_ string) error {
 	return nil
 }
 
-func chown(name string, uid, gid int) error {
+func chown(_ string, _, _ int) error {
 	// Chown not supported on Windows
 	return nil
 }

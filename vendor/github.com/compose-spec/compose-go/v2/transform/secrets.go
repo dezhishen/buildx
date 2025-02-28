@@ -22,7 +22,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/tree"
 )
 
-func transformFileMount(data any, p tree.Path) (any, error) {
+func transformFileMount(data any, p tree.Path, _ bool) (any, error) {
 	switch v := data.(type) {
 	case map[string]any:
 		return data, nil
@@ -30,6 +30,19 @@ func transformFileMount(data any, p tree.Path) (any, error) {
 		return map[string]any{
 			"source": v,
 		}, nil
+	default:
+		return nil, fmt.Errorf("%s: unsupported type %T", p, data)
+	}
+}
+
+func defaultSecretMount(data any, p tree.Path, _ bool) (any, error) {
+	switch v := data.(type) {
+	case map[string]any:
+		source := v["source"]
+		if _, ok := v["target"]; !ok {
+			v["target"] = fmt.Sprintf("/run/secrets/%s", source)
+		}
+		return v, nil
 	default:
 		return nil, fmt.Errorf("%s: unsupported type %T", p, data)
 	}

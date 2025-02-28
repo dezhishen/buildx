@@ -58,7 +58,7 @@ func (w *containerWorker) New(ctx context.Context, cfg *integration.BackendConfi
 	cmd := exec.Command("buildx", "create",
 		"--bootstrap",
 		"--name="+name,
-		"--config="+cfgfile,
+		"--buildkitd-config="+cfgfile,
 		"--driver=docker-container",
 		"--driver-opt=network=host",
 	)
@@ -73,6 +73,11 @@ func (w *containerWorker) New(ctx context.Context, cfg *integration.BackendConfi
 
 	cl := func() error {
 		cmd := exec.Command("buildx", "rm", "-f", name)
+		cmd.Env = append(
+			os.Environ(),
+			"BUILDX_CONFIG=/tmp/buildx-"+name,
+			"DOCKER_CONTEXT="+w.docker.DockerAddress(),
+		)
 		return cmd.Run()
 	}
 
