@@ -11,11 +11,12 @@ Remove one or more builder instances
 
 | Name                                | Type     | Default | Description                              |
 |:------------------------------------|:---------|:--------|:-----------------------------------------|
-| [`--all-inactive`](#all-inactive)   |          |         | Remove all inactive builders             |
+| [`--all-inactive`](#all-inactive)   | `bool`   |         | Remove all inactive builders             |
 | [`--builder`](#builder)             | `string` |         | Override the configured builder instance |
-| [`-f`](#force), [`--force`](#force) |          |         | Do not prompt for confirmation           |
-| [`--keep-daemon`](#keep-daemon)     |          |         | Keep the buildkitd daemon running        |
-| [`--keep-state`](#keep-state)       |          |         | Keep BuildKit state                      |
+| `-D`, `--debug`                     | `bool`   |         | Enable debug logging                     |
+| [`-f`](#force), [`--force`](#force) | `bool`   |         | Do not prompt for confirmation           |
+| [`--keep-daemon`](#keep-daemon)     | `bool`   |         | Keep the BuildKit daemon running         |
+| [`--keep-state`](#keep-state)       | `bool`   |         | Keep BuildKit state                      |
 
 
 <!---MARKER_GEN_END-->
@@ -48,10 +49,10 @@ Do not prompt for confirmation before removing inactive builders.
 $ docker buildx rm --all-inactive --force
 ```
 
-### <a name="keep-daemon"></a> Keep the buildkitd daemon running (--keep-daemon)
+### <a name="keep-daemon"></a> Keep the BuildKit daemon running (--keep-daemon)
 
 Keep the BuildKit daemon running after the buildx context is removed. This is
-useful when you manage buildkitd daemons and buildx contexts independently.
+useful when you manage BuildKit daemons and buildx contexts independently.
 Only supported by the
 [`docker-container`](https://docs.docker.com/build/drivers/docker-container/)
 and [`kubernetes`](https://docs.docker.com/build/drivers/kubernetes/) drivers.

@@ -22,18 +22,27 @@ import (
 	"github.com/compose-spec/compose-go/v2/tree"
 )
 
-func transformBuild(data any, p tree.Path) (any, error) {
+func transformBuild(data any, p tree.Path, ignoreParseError bool) (any, error) {
 	switch v := data.(type) {
 	case map[string]any:
-		if _, ok := v["context"]; !ok {
-			v["context"] = "." // TODO(ndeloof) maybe we miss an explicit "set-defaults" loading phase
-		}
-		return transformMapping(v, p)
+		return transformMapping(v, p, ignoreParseError)
 	case string:
 		return map[string]any{
 			"context": v,
 		}, nil
 	default:
 		return data, fmt.Errorf("%s: invalid type %T for build", p, v)
+	}
+}
+
+func defaultBuildContext(data any, _ tree.Path, _ bool) (any, error) {
+	switch v := data.(type) {
+	case map[string]any:
+		if _, ok := v["context"]; !ok {
+			v["context"] = "."
+		}
+		return v, nil
+	default:
+		return data, nil
 	}
 }

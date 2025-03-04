@@ -1,7 +1,6 @@
 package client
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"time"
@@ -23,12 +22,7 @@ type repositoryEndpoint struct {
 
 // Name returns the repository name
 func (r repositoryEndpoint) Name() string {
-	repoName := r.info.Name.Name()
-	// If endpoint does not support CanonicalName, use the RemoteName instead
-	if r.endpoint.TrimHostname {
-		repoName = reference.Path(r.info.Name)
-	}
-	return repoName
+	return reference.Path(r.info.Name)
 }
 
 // BaseURL returns the endpoint url
@@ -83,7 +77,6 @@ func getHTTPTransport(authConfig registrytypes.AuthConfig, endpoint registry.API
 		Dial: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
-			DualStack: true,
 		}).Dial,
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     endpoint.TLSConfig,
@@ -126,10 +119,10 @@ type existingTokenHandler struct {
 }
 
 func (th *existingTokenHandler) AuthorizeRequest(req *http.Request, _ map[string]string) error {
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", th.token))
+	req.Header.Set("Authorization", "Bearer "+th.token)
 	return nil
 }
 
-func (th *existingTokenHandler) Scheme() string {
+func (*existingTokenHandler) Scheme() string {
 	return "bearer"
 }

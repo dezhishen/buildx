@@ -6,9 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/platforms"
 	"github.com/docker/buildx/driver"
-	ctxkube "github.com/docker/buildx/driver/kubernetes/context"
 	"github.com/docker/buildx/store"
 	"github.com/docker/buildx/store/storeutil"
 	"github.com/docker/buildx/util/dockerutil"
@@ -18,7 +17,6 @@ import (
 	"github.com/moby/buildkit/util/grpcerrors"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 )
@@ -34,10 +32,11 @@ type Node struct {
 	Err         error
 
 	// worker settings
-	IDs       []string
-	Platforms []ocispecs.Platform
-	GCPolicy  []client.PruneInfo
-	Labels    map[string]string
+	IDs        []string
+	Platforms  []ocispecs.Platform
+	GCPolicy   []client.PruneInfo
+	Labels     map[string]string
+	CDIDevices []client.CDIDevice
 }
 
 // Nodes returns nodes for this builder.
@@ -48,8 +47,9 @@ func (b *Builder) Nodes() []Node {
 type LoadNodesOption func(*loadNodesOptions)
 
 type loadNodesOptions struct {
-	data     bool
-	dialMeta map[string][]string
+	data      bool
+	dialMeta  map[string][]string
+	clientOpt []client.ClientOpt
 }
 
 func WithData() LoadNodesOption {
@@ -61,6 +61,12 @@ func WithData() LoadNodesOption {
 func WithDialMeta(dialMeta map[string][]string) LoadNodesOption {
 	return func(o *loadNodesOptions) {
 		o.dialMeta = dialMeta
+	}
+}
+
+func WithClientOpt(clientOpt ...client.ClientOpt) LoadNodesOption {
+	return func(o *loadNodesOptions) {
+		o.clientOpt = clientOpt
 	}
 }
 
@@ -112,37 +118,19 @@ func (b *Builder) LoadNodes(ctx context.Context, opts ...LoadNodesOption) (_ []N
 					return nil
 				}
 
-				contextStore := b.opts.dockerCli.ContextStore()
-
-				var kcc driver.KubeClientConfig
-				kcc, err = ctxkube.ConfigFromEndpoint(n.Endpoint, contextStore)
-				if err != nil {
-					// err is returned if n.Endpoint is non-context name like "unix:///var/run/docker.sock".
-					// try again with name="default".
-					// FIXME(@AkihiroSuda): n should retain real context name.
-					kcc, err = ctxkube.ConfigFromEndpoint("default", contextStore)
-					if err != nil {
-						logrus.Error(err)
-					}
-				}
-
-				tryToUseKubeConfigInCluster := false
-				if kcc == nil {
-					tryToUseKubeConfigInCluster = true
-				} else {
-					if _, err := kcc.ClientConfig(); err != nil {
-						tryToUseKubeConfigInCluster = true
-					}
-				}
-				if tryToUseKubeConfigInCluster {
-					kccInCluster := driver.KubeClientConfigInCluster{}
-					if _, err := kccInCluster.ClientConfig(); err == nil {
-						logrus.Debug("using kube config in cluster")
-						kcc = kccInCluster
-					}
-				}
-
-				d, err := driver.GetDriver(ctx, "buildx_buildkit_"+n.Name, factory, n.Endpoint, dockerapi, imageopt.Auth, kcc, n.Flags, n.Files, n.DriverOpts, n.Platforms, b.opts.contextPathHash, lno.dialMeta)
+				d, err := driver.GetDriver(ctx, factory, driver.InitConfig{
+					Name:            driver.BuilderName(n.Name),
+					EndpointAddr:    n.Endpoint,
+					DockerAPI:       dockerapi,
+					ContextStore:    b.opts.dockerCli.ContextStore(),
+					BuildkitdFlags:  n.BuildkitdFlags,
+					Files:           n.Files,
+					DriverOpts:      n.DriverOpts,
+					Auth:            imageopt.Auth,
+					Platforms:       n.Platforms,
+					ContextPathHash: b.opts.contextPathHash,
+					DialMeta:        lno.dialMeta,
+				})
 				if err != nil {
 					node.Err = err
 					return nil
@@ -151,7 +139,7 @@ func (b *Builder) LoadNodes(ctx context.Context, opts ...LoadNodesOption) (_ []N
 				node.ImageOpt = imageopt
 
 				if lno.data {
-					if err := node.loadData(ctx); err != nil {
+					if err := node.loadData(ctx, lno.clientOpt...); err != nil {
 						node.Err = err
 					}
 				}
@@ -186,7 +174,7 @@ func (b *Builder) LoadNodes(ctx context.Context, opts ...LoadNodesOption) (_ []N
 						if pl := di.DriverInfo.DynamicNodes[i].Platforms; len(pl) > 0 {
 							diClone.Platforms = pl
 						}
-						nodes = append(nodes, di)
+						nodes = append(nodes, diClone)
 					}
 					dynamicNodes = append(dynamicNodes, di.DriverInfo.DynamicNodes...)
 				}
@@ -217,37 +205,37 @@ func (n *Node) MarshalJSON() ([]byte, error) {
 		pp = append(pp, platforms.Format(p))
 	}
 	return json.Marshal(struct {
-		Name        string
-		Endpoint    string
-		Flags       []string           `json:",omitempty"`
-		DriverOpts  map[string]string  `json:",omitempty"`
-		Files       map[string][]byte  `json:",omitempty"`
-		Status      string             `json:",omitempty"`
-		ProxyConfig map[string]string  `json:",omitempty"`
-		Version     string             `json:",omitempty"`
-		Err         string             `json:",omitempty"`
-		IDs         []string           `json:",omitempty"`
-		Platforms   []string           `json:",omitempty"`
-		GCPolicy    []client.PruneInfo `json:",omitempty"`
-		Labels      map[string]string  `json:",omitempty"`
+		Name           string
+		Endpoint       string
+		BuildkitdFlags []string           `json:"Flags,omitempty"`
+		DriverOpts     map[string]string  `json:",omitempty"`
+		Files          map[string][]byte  `json:",omitempty"`
+		Status         string             `json:",omitempty"`
+		ProxyConfig    map[string]string  `json:",omitempty"`
+		Version        string             `json:",omitempty"`
+		Err            string             `json:",omitempty"`
+		IDs            []string           `json:",omitempty"`
+		Platforms      []string           `json:",omitempty"`
+		GCPolicy       []client.PruneInfo `json:",omitempty"`
+		Labels         map[string]string  `json:",omitempty"`
 	}{
-		Name:        n.Name,
-		Endpoint:    n.Endpoint,
-		Flags:       n.Flags,
-		DriverOpts:  n.DriverOpts,
-		Files:       n.Files,
-		Status:      status,
-		ProxyConfig: n.ProxyConfig,
-		Version:     n.Version,
-		Err:         nerr,
-		IDs:         n.IDs,
-		Platforms:   pp,
-		GCPolicy:    n.GCPolicy,
-		Labels:      n.Labels,
+		Name:           n.Name,
+		Endpoint:       n.Endpoint,
+		BuildkitdFlags: n.BuildkitdFlags,
+		DriverOpts:     n.DriverOpts,
+		Files:          n.Files,
+		Status:         status,
+		ProxyConfig:    n.ProxyConfig,
+		Version:        n.Version,
+		Err:            nerr,
+		IDs:            n.IDs,
+		Platforms:      pp,
+		GCPolicy:       n.GCPolicy,
+		Labels:         n.Labels,
 	})
 }
 
-func (n *Node) loadData(ctx context.Context) error {
+func (n *Node) loadData(ctx context.Context, clientOpt ...client.ClientOpt) error {
 	if n.Driver == nil {
 		return nil
 	}
@@ -257,7 +245,7 @@ func (n *Node) loadData(ctx context.Context) error {
 	}
 	n.DriverInfo = info
 	if n.DriverInfo.Status == driver.Running {
-		driverClient, err := n.Driver.Client(ctx)
+		driverClient, err := n.Driver.Client(ctx, clientOpt...)
 		if err != nil {
 			return err
 		}
@@ -272,6 +260,7 @@ func (n *Node) loadData(ctx context.Context) error {
 				n.GCPolicy = w.GCPolicy
 				n.Labels = w.Labels
 			}
+			n.CDIDevices = w.CDIDevices
 		}
 		sort.Strings(n.IDs)
 		n.Platforms = platformutil.Dedupe(n.Platforms)

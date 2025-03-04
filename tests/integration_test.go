@@ -21,6 +21,7 @@ func init() {
 
 func TestIntegration(t *testing.T) {
 	var tests []func(t *testing.T, sb integration.Sandbox)
+	tests = append(tests, commonTests...)
 	tests = append(tests, buildTests...)
 	tests = append(tests, bakeTests...)
 	tests = append(tests, inspectTests...)
@@ -35,7 +36,7 @@ func TestIntegration(t *testing.T) {
 
 func testIntegration(t *testing.T, funcs ...func(t *testing.T, sb integration.Sandbox)) {
 	mirroredImages := integration.OfficialImages("busybox:latest", "alpine:latest")
-	buildkitImage := "docker.io/moby/buildkit:buildx-stable-1"
+	buildkitImage = "docker.io/moby/buildkit:" + buildkitTag()
 	if bkworkers.IsTestDockerd() {
 		if img, ok := os.LookupEnv("TEST_BUILDKIT_IMAGE"); ok {
 			ref, err := reference.ParseNormalizedNamed(img)

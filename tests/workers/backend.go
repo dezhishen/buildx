@@ -19,6 +19,10 @@ func (s *backend) Address() string {
 	return s.builder
 }
 
+func (s *backend) DebugAddress() string {
+	return ""
+}
+
 func (s *backend) DockerAddress() string {
 	return s.context
 }
@@ -37,6 +41,10 @@ func (s *backend) Rootless() bool {
 
 func (s *backend) NetNSDetached() bool {
 	return false
+}
+
+func (s *backend) ExtraEnv() []string {
+	return nil
 }
 
 func (s backend) Supports(feature string) bool {
