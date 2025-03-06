@@ -55,9 +55,6 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 		switch {
 		case k == "network":
 			d.netMode = v
-			if v == "host" {
-				d.InitConfig.BuildkitFlags = append(d.InitConfig.BuildkitFlags, "--allow-insecure-entitlement=network.host")
-			}
 		case k == "image":
 			d.image = v
 		case k == "memory":
@@ -94,6 +91,11 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 			d.cgroupParent = v
 		case k == "restart-policy":
 			d.restartPolicy, err = dockeropts.ParseRestartPolicy(v)
+			if err != nil {
+				return nil, err
+			}
+		case k == "default-load":
+			d.defaultLoad, err = strconv.ParseBool(v)
 			if err != nil {
 				return nil, err
 			}

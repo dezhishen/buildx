@@ -5,13 +5,15 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/docker/buildx/driver"
 	"github.com/docker/cli/opts"
-	"github.com/docker/docker/builder/remotecontext/urlutil"
 	"github.com/moby/buildkit/util/gitutil"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -23,8 +25,15 @@ const (
 	mobyHostGatewayName = "host-gateway"
 )
 
+// isHTTPURL returns true if the provided str is an HTTP(S) URL by checking if it
+// has a http:// or https:// scheme. No validation is performed to verify if the
+// URL is well-formed.
+func isHTTPURL(str string) bool {
+	return strings.HasPrefix(str, "https://") || strings.HasPrefix(str, "http://")
+}
+
 func IsRemoteURL(c string) bool {
-	if urlutil.IsURL(c) {
+	if isHTTPURL(c) {
 		return true
 	}
 	if _, err := gitutil.ParseGitRef(c); err == nil {
@@ -100,4 +109,22 @@ func toBuildkitUlimits(inp *opts.UlimitOpt) (string, error) {
 		ulimits = append(ulimits, ulimit.String())
 	}
 	return strings.Join(ulimits, ","), nil
+}
+
+func notSupported(f driver.Feature, d *driver.DriverHandle, docs string) error {
+	return errors.Errorf(`%s is not supported for the %s driver.
+Switch to a different driver, or turn on the containerd image store, and try again.
+Learn more at %s`, f, d.Factory().Name(), docs)
+}
+
+func noDefaultLoad() bool {
+	v, ok := os.LookupEnv("BUILDX_NO_DEFAULT_LOAD")
+	if !ok {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		logrus.Warnf("invalid non-bool value for BUILDX_NO_DEFAULT_LOAD: %s", v)
+	}
+	return b
 }

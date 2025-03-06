@@ -4,11 +4,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"os"
+	"strings"
 
 	"github.com/docker/buildx/builder"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/util/progress"
+	"github.com/docker/go-units"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend/dockerui"
@@ -17,19 +20,42 @@ import (
 	"github.com/pkg/errors"
 )
 
+const maxBakeDefinitionSize = 2 * 1024 * 1024 // 2 MB
+
 type Input struct {
 	State *llb.State
 	URL   string
 }
 
 func ReadRemoteFiles(ctx context.Context, nodes []builder.Node, url string, names []string, pw progress.Writer) ([]File, *Input, error) {
-	var session []session.Attachable
+	var sessions []session.Attachable
 	var filename string
+
 	st, ok := dockerui.DetectGitContext(url, false)
 	if ok {
-		ssh, err := controllerapi.CreateSSH([]*controllerapi.SSH{{ID: "default"}})
-		if err == nil {
-			session = append(session, ssh)
+		if ssh, err := controllerapi.CreateSSH([]*controllerapi.SSH{{
+			ID:    "default",
+			Paths: strings.Split(os.Getenv("BUILDX_BAKE_GIT_SSH"), ","),
+		}}); err == nil {
+			sessions = append(sessions, ssh)
+		}
+		var gitAuthSecrets []*controllerapi.Secret
+		if _, ok := os.LookupEnv("BUILDX_BAKE_GIT_AUTH_TOKEN"); ok {
+			gitAuthSecrets = append(gitAuthSecrets, &controllerapi.Secret{
+				ID:  llb.GitAuthTokenKey,
+				Env: "BUILDX_BAKE_GIT_AUTH_TOKEN",
+			})
+		}
+		if _, ok := os.LookupEnv("BUILDX_BAKE_GIT_AUTH_HEADER"); ok {
+			gitAuthSecrets = append(gitAuthSecrets, &controllerapi.Secret{
+				ID:  llb.GitAuthHeaderKey,
+				Env: "BUILDX_BAKE_GIT_AUTH_HEADER",
+			})
+		}
+		if len(gitAuthSecrets) > 0 {
+			if secrets, err := controllerapi.CreateSecrets(gitAuthSecrets); err == nil {
+				sessions = append(sessions, secrets)
+			}
 		}
 	} else {
 		st, filename, ok = dockerui.DetectHTTPContext(url)
@@ -59,7 +85,7 @@ func ReadRemoteFiles(ctx context.Context, nodes []builder.Node, url string, name
 
 	ch, done := progress.NewChannel(pw)
 	defer func() { <-done }()
-	_, err = c.Build(ctx, client.SolveOpt{Session: session, Internal: true}, "buildx", func(ctx context.Context, c gwclient.Client) (*gwclient.Result, error) {
+	_, err = c.Build(ctx, client.SolveOpt{Session: sessions, Internal: true}, "buildx", func(ctx context.Context, c gwclient.Client) (*gwclient.Result, error) {
 		def, err := st.Marshal(ctx)
 		if err != nil {
 			return nil, err
@@ -83,7 +109,6 @@ func ReadRemoteFiles(ctx context.Context, nodes []builder.Node, url string, name
 		}
 		return nil, err
 	}, ch)
-
 	if err != nil {
 		return nil, nil, err
 	}
@@ -155,9 +180,9 @@ func filesFromURLRef(ctx context.Context, c gwclient.Client, ref gwclient.Refere
 	name := inp.URL
 	inp.URL = ""
 
-	if len(dt) > stat.Size() {
-		if stat.Size() > 1024*512 {
-			return nil, errors.Errorf("non-archive definition URL bigger than maximum allowed size")
+	if int64(len(dt)) > stat.Size {
+		if stat.Size > maxBakeDefinitionSize {
+			return nil, errors.Errorf("non-archive definition URL bigger than maximum allowed size (%s)", units.HumanSize(maxBakeDefinitionSize))
 		}
 
 		dt, err = ref.ReadFile(ctx, gwclient.ReadRequest{

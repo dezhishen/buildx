@@ -25,7 +25,9 @@ func (cli *Client) ServiceCreate(ctx context.Context, service swarm.ServiceSpec,
 	//
 	// Normally, version-negotiation (if enabled) would not happen until
 	// the API request is made.
-	cli.checkVersion(ctx)
+	if err := cli.checkVersion(ctx); err != nil {
+		return response, err
+	}
 
 	// Make sure containerSpec is not nil when no runtime is set or the runtime is set to container
 	if service.TaskTemplate.ContainerSpec == nil && (service.TaskTemplate.Runtime == "" || service.TaskTemplate.Runtime == swarm.RuntimeContainer) {
@@ -71,7 +73,7 @@ func (cli *Client) ServiceCreate(ctx context.Context, service swarm.ServiceSpec,
 		return response, err
 	}
 
-	err = json.NewDecoder(resp.body).Decode(&response)
+	err = json.NewDecoder(resp.Body).Decode(&response)
 	if resolveWarning != "" {
 		response.Warnings = append(response.Warnings, resolveWarning)
 	}
