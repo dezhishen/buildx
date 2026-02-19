@@ -308,7 +308,7 @@ func newBuildRequests(ctx context.Context, docker *dockerutil.Client, cfg *confu
 				return nil, nil, err
 			}
 			localOpt := opt
-			so, release, err := toSolveOpt(ctx, np.Node(), multiDriver, &localOpt, gatewayOpts, cfg, w, docker)
+			so, release, err := toSolveOpt(ctx, np, multiDriver, &localOpt, gatewayOpts, cfg, w, docker)
 			opts[k] = localOpt
 			if err != nil {
 				return nil, nil, err

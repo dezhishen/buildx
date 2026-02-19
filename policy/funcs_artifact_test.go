@@ -127,3 +127,40 @@ func TestBuiltinArtifactAttestationImpl(t *testing.T) {
 		require.Contains(t, st.Unknowns, funcArtifactAttestation)
 	})
 }
+
+func TestBuiltinGithubAttestationImpl(t *testing.T) {
+	t.Run("missing checksum adds unknown", func(t *testing.T) {
+		st := &state{Input: Input{HTTP: &HTTP{}}}
+
+		p := NewPolicy(Opt{})
+		httpVal, err := ast.InterfaceToValue(st.Input.HTTP)
+		require.NoError(t, err)
+
+		term, err := p.builtinGithubAttestationImpl(
+			rego.BuiltinContext{Context: t.Context()},
+			ast.NewTerm(httpVal),
+			ast.StringTerm("docker/buildx"),
+			st,
+		)
+		require.NoError(t, err)
+		require.Nil(t, term)
+		require.Contains(t, st.Unknowns, funcGithubAttestation)
+	})
+
+	t.Run("resolver required", func(t *testing.T) {
+		st := &state{Input: Input{HTTP: &HTTP{Checksum: digest.FromString("artifact-bytes").String()}}}
+
+		p := NewPolicy(Opt{})
+		httpVal, err := ast.InterfaceToValue(st.Input.HTTP)
+		require.NoError(t, err)
+
+		term, err := p.builtinGithubAttestationImpl(
+			rego.BuiltinContext{Context: t.Context()},
+			ast.NewTerm(httpVal),
+			ast.StringTerm("docker/buildx"),
+			st,
+		)
+		require.Nil(t, term)
+		require.EqualError(t, err, "github_attestation: source resolver is not configured")
+	})
+}

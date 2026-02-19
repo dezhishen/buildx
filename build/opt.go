@@ -23,7 +23,7 @@ import (
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
-	"github.com/docker/buildx/builder"
+	noderesolver "github.com/docker/buildx/build/resolver"
 	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/policy"
 	"github.com/docker/buildx/util/buildflags"
@@ -31,6 +31,7 @@ import (
 	"github.com/docker/buildx/util/dockerutil"
 	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/progress"
+	"github.com/docker/buildx/util/sourcemeta"
 	"github.com/docker/buildx/util/urlutil"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
@@ -222,7 +223,8 @@ func isPolicyEvaluationError(policies []*policy.Policy, err error) bool {
 	return false
 }
 
-func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *Options, bopts gateway.BuildOpts, cfg *confutil.Config, pw progress.Writer, docker *dockerutil.Client) (_ *client.SolveOpt, release func(error), err error) {
+func toSolveOpt(ctx context.Context, np *noderesolver.ResolvedNode, multiDriver bool, opt *Options, bopts gateway.BuildOpts, cfg *confutil.Config, pw progress.Writer, docker *dockerutil.Client) (_ *client.SolveOpt, release func(error), err error) {
+	node := np.Node()
 	nodeDriver := node.Driver
 	defers := make([]func(error), 0, 2)
 	releaseF := func(inErr error) {
@@ -513,6 +515,17 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 		if err != nil {
 			return nil, nil, err
 		}
+		var sourceResolver *sourcemeta.Resolver
+		if len(popts) > 0 {
+			c, err := np.Client(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			sourceResolver = sourcemeta.NewResolver(c, sourcemeta.WithProgressWriter(pw))
+			defers = append(defers, func(error) {
+				_ = sourceResolver.Close()
+			})
+		}
 		var policyFiles []string
 		for _, popt := range popts {
 			for _, f := range popt.Files {
@@ -554,6 +567,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 				FS:               opt.Inputs.policy.FS,
 				VerifierProvider: policy.SignatureVerifier(cfg),
 				DefaultPlatform:  defaultPlatform(bopts),
+				SourceResolver:   sourceResolver,
 			})
 			policies = append(policies, p)
 			cbs = append(cbs, p.CheckPolicy)

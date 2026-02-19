@@ -1,12 +1,20 @@
 package policy
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
+	"net/url"
 	"strings"
 
 	"github.com/distribution/reference"
+	"github.com/golang/snappy"
+	slsa1 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v1"
+	"github.com/moby/buildkit/client/llb"
+	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/gitutil/gitsign"
 	"github.com/open-policy-agent/opa/v1/ast"
@@ -14,6 +22,7 @@ import (
 	"github.com/open-policy-agent/opa/v1/types"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -21,6 +30,7 @@ const (
 	funcVerifyGitSignature  = "verify_git_signature"
 	funcPinImage            = "pin_image"
 	funcArtifactAttestation = "artifact_attestation"
+	funcGithubAttestation   = "github_attestation"
 )
 
 func (p *Policy) initBuiltinFuncs() {
@@ -99,6 +109,216 @@ func (p *Policy) initBuiltinFuncs() {
 			})
 		},
 	})
+
+	githubAttestation := &rego.Function{
+		Name: funcGithubAttestation,
+		Decl: types.NewFunction(
+			types.Args(
+				types.A,
+				types.S,
+			),
+			types.A,
+		),
+		Memoize: false,
+	}
+	p.funcs = append(p.funcs, fun{
+		decl: githubAttestation,
+		impl: func(s *state) func(*rego.Rego) {
+			return rego.Function2(githubAttestation, func(bctx rego.BuiltinContext, a1 *ast.Term, a2 *ast.Term) (*ast.Term, error) {
+				return p.builtinGithubAttestationImpl(bctx, a1, a2, s)
+			})
+		},
+	})
+}
+
+func (p *Policy) builtinGithubAttestationImpl(bctx rego.BuiltinContext, a1, a2 *ast.Term, s *state) (*ast.Term, error) {
+	inp := s.Input
+	if inp.HTTP == nil {
+		return nil, nil
+	}
+
+	obja, ok := a1.Value.(ast.Object)
+	if !ok {
+		return nil, errors.Errorf("%s: expected object, got %T", funcGithubAttestation, a1.Value)
+	}
+
+	httpValue, err := ast.InterfaceToValue(inp.HTTP)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: failed converting object to interface", funcGithubAttestation)
+	}
+
+	if obja.Compare(httpValue) != 0 {
+		return nil, errors.Errorf("%s: first argument is not the same as input http", funcGithubAttestation)
+	}
+
+	repo, ok := a2.Value.(ast.String)
+	if !ok {
+		return nil, errors.Errorf("%s: expected repository name string, got %T", funcGithubAttestation, a2.Value)
+	}
+
+	if inp.HTTP.Checksum == "" {
+		s.addUnknown(funcGithubAttestation)
+		return nil, nil
+	}
+
+	if p.opt.SourceResolver == nil {
+		return nil, errors.Errorf("%s: source resolver is not configured", funcGithubAttestation)
+	}
+	if p.opt.VerifierProvider == nil {
+		return nil, errors.Errorf("%s: policy verifier is not configured", funcGithubAttestation)
+	}
+
+	dgst, err := digest.Parse(inp.HTTP.Checksum)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: invalid checksum", funcGithubAttestation)
+	}
+
+	v, err := p.opt.VerifierProvider()
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: getting policy verifier", funcGithubAttestation)
+	}
+
+	bundles, err := p.readGitHubAttestationBundles(bctx.Context, string(repo), dgst)
+	if err != nil {
+		p.log(logrus.InfoLevel, "%s: failed reading bundles for %s@%s: %v", funcGithubAttestation, repo, dgst, err)
+		return nil, nil
+	}
+	if len(bundles) == 0 {
+		p.log(logrus.InfoLevel, "%s: no bundle found for %s@%s", funcGithubAttestation, repo, dgst)
+		return nil, nil
+	}
+
+	for _, bundleBytes := range bundles {
+		siRaw, err := v.VerifyArtifact(bctx.Context, dgst, bundleBytes)
+		if err != nil {
+			p.log(logrus.InfoLevel, "%s: failed verifying bundle for %s@%s: %v", funcGithubAttestation, repo, dgst, err)
+			continue
+		}
+		si := toAttestationSignature(siRaw)
+		astVal, err := ast.InterfaceToValue(si)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: failed converting verification result", funcGithubAttestation)
+		}
+		return ast.NewTerm(astVal), nil
+	}
+
+	return nil, nil
+}
+
+func (p *Policy) readGitHubAttestationBundles(ctx context.Context, repo string, dgst digest.Digest) ([][]byte, error) {
+	const (
+		attestationFilename = "attestation.json"
+		bundleFilename      = "bundle.json"
+	)
+
+	u := fmt.Sprintf(
+		"https://api.github.com/repos/%s/attestations/%s?predicate_type=%s",
+		repo,
+		dgst.String(),
+		url.QueryEscape(slsa1.PredicateSLSAProvenance),
+	)
+	st := llb.HTTP(
+		u,
+		llb.Filename(attestationFilename),
+		llb.WithCustomNamef("[policy] fetch GitHub attestation %s@%s", repo, dgst.String()),
+		llb.Header(llb.HTTPHeader{
+			Accept: "application/vnd.github+json",
+		}),
+	)
+	ref, err := p.opt.SourceResolver.ResolveState(ctx, st)
+	if err != nil {
+		return nil, errors.Wrapf(err, "resolve GitHub attestation request")
+	}
+
+	raw, err := ref.ReadFile(ctx, gwclient.ReadRequest{Filename: attestationFilename})
+	if err != nil {
+		return nil, errors.Wrapf(err, "read GitHub attestation response")
+	}
+
+	bundles, bundleURLs := githubAttestationBundlesFromResponse(raw)
+	p.log(logrus.InfoLevel, "%s: fetched %d inline bundles and %d bundle URLs from %s", funcGithubAttestation, len(bundles), len(bundleURLs), u)
+	for _, bu := range bundleURLs {
+		// bundle_url is a signed URL to the bundle payload.
+		st := llb.HTTP(
+			bu,
+			llb.Filename(bundleFilename),
+			llb.WithCustomNamef("[policy] fetch GitHub attestation bundle %s", stripRawQuery(bu)),
+		)
+		ref, err := p.opt.SourceResolver.ResolveState(ctx, st)
+		if err != nil {
+			p.log(logrus.InfoLevel, "%s: failed fetching bundle_url %s: %v", funcGithubAttestation, bu, err)
+			continue
+		}
+		bundleRaw, err := ref.ReadFile(ctx, gwclient.ReadRequest{Filename: bundleFilename})
+		if err != nil {
+			p.log(logrus.InfoLevel, "%s: failed reading bundle_url %s: %v", funcGithubAttestation, bu, err)
+			continue
+		}
+		bundleRaw = bytes.TrimSpace(bundleRaw)
+		if len(bundleRaw) == 0 || bytes.Equal(bundleRaw, []byte("null")) {
+			continue
+		}
+		if shouldDecodeSnappyBundleURL(bu) {
+			decoded, err := snappy.Decode(nil, bundleRaw)
+			if err != nil {
+				p.log(logrus.InfoLevel, "%s: failed decoding snappy bundle_url %s: %v", funcGithubAttestation, bu, err)
+				continue
+			}
+			bundleRaw = decoded
+		}
+		bundles = append(bundles, bundleRaw)
+	}
+	return bundles, nil
+}
+
+func githubAttestationBundlesFromResponse(raw []byte) ([][]byte, []string) {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 {
+		return nil, nil
+	}
+
+	var parsed struct {
+		Attestations []struct {
+			Bundle    json.RawMessage `json:"bundle"`
+			BundleURL string          `json:"bundle_url"`
+		} `json:"attestations"`
+	}
+	if err := json.Unmarshal(t, &parsed); err != nil {
+		return nil, nil
+	}
+	out := make([][]byte, 0, len(parsed.Attestations))
+	bundleURLs := make([]string, 0, len(parsed.Attestations))
+	appendCandidate := func(dt []byte) {
+		dt = bytes.TrimSpace(dt)
+		if len(dt) == 0 || bytes.Equal(dt, []byte("null")) {
+			return
+		}
+		out = append(out, dt)
+	}
+	for _, a := range parsed.Attestations {
+		appendCandidate(a.Bundle)
+		if a.BundleURL != "" {
+			bundleURLs = append(bundleURLs, a.BundleURL)
+		}
+	}
+	return out, bundleURLs
+}
+
+func shouldDecodeSnappyBundleURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(u.Path, ".json.sn")
+}
+
+func stripRawQuery(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.RawQuery = ""
+	return u.String()
 }
 
 func (p *Policy) builtinArtifactAttestationImpl(bctx rego.BuiltinContext, a1, a2 *ast.Term, s *state) (*ast.Term, error) {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
+	"github.com/docker/buildx/util/sourcemeta"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/solver/pb"
 	moby_buildkit_v1_sourcepolicy "github.com/moby/buildkit/sourcepolicy/pb"
@@ -64,6 +65,7 @@ type Opt struct {
 	FS               func() (fs.StatFS, func() error, error)
 	VerifierProvider PolicyVerifierProvider
 	DefaultPlatform  *ocispecs.Platform
+	SourceResolver   *sourcemeta.Resolver
 }
 
 var _ policysession.PolicyCallback = (&Policy{}).CheckPolicy
@@ -798,6 +800,8 @@ func runtimeUnknownInputRefs(st *state) []string {
 		out = append(out, "git.commit")
 	}
 	if _, ok := st.Unknowns[funcArtifactAttestation]; ok {
+		out = append(out, "http.checksum")
+	} else if _, ok := st.Unknowns[funcGithubAttestation]; ok {
 		out = append(out, "http.checksum")
 	}
 	return out
