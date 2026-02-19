@@ -64,10 +64,11 @@ func TestRuntimeUnknownInputRefs(t *testing.T) {
 
 	st := &state{
 		Unknowns: map[string]struct{}{
-			funcVerifyGitSignature: {},
+			funcVerifyGitSignature:  {},
+			funcArtifactAttestation: {},
 		},
 	}
-	require.Equal(t, []string{"git.commit"}, runtimeUnknownInputRefs(st))
+	require.Equal(t, []string{"git.commit", "http.checksum"}, runtimeUnknownInputRefs(st))
 }
 
 func TestMissingInputRefsWithRuntimeUnknowns(t *testing.T) {

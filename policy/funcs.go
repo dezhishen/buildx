@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	funcLoadJSON           = "load_json"
-	funcVerifyGitSignature = "verify_git_signature"
-	funcPinImage           = "pin_image"
+	funcLoadJSON            = "load_json"
+	funcVerifyGitSignature  = "verify_git_signature"
+	funcPinImage            = "pin_image"
+	funcArtifactAttestation = "artifact_attestation"
 )
 
 func (p *Policy) initBuiltinFuncs() {
@@ -78,6 +79,88 @@ func (p *Policy) initBuiltinFuncs() {
 			})
 		},
 	})
+
+	artifactAttestation := &rego.Function{
+		Name: funcArtifactAttestation,
+		Decl: types.NewFunction(
+			types.Args(
+				types.A,
+				types.S,
+			),
+			types.A,
+		),
+		Memoize: false,
+	}
+	p.funcs = append(p.funcs, fun{
+		decl: artifactAttestation,
+		impl: func(s *state) func(*rego.Rego) {
+			return rego.Function2(artifactAttestation, func(bctx rego.BuiltinContext, a1 *ast.Term, a2 *ast.Term) (*ast.Term, error) {
+				return p.builtinArtifactAttestationImpl(bctx, a1, a2, s)
+			})
+		},
+	})
+}
+
+func (p *Policy) builtinArtifactAttestationImpl(bctx rego.BuiltinContext, a1, a2 *ast.Term, s *state) (*ast.Term, error) {
+	inp := s.Input
+	if inp.HTTP == nil {
+		return nil, nil
+	}
+
+	obja, ok := a1.Value.(ast.Object)
+	if !ok {
+		return nil, errors.Errorf("%s: expected object, got %T", funcArtifactAttestation, a1.Value)
+	}
+
+	httpValue, err := ast.InterfaceToValue(inp.HTTP)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: failed converting object to interface", funcArtifactAttestation)
+	}
+
+	if obja.Compare(httpValue) != 0 {
+		return nil, errors.Errorf("%s: first argument is not the same as input http", funcArtifactAttestation)
+	}
+
+	path, ok := a2.Value.(ast.String)
+	if !ok {
+		return nil, errors.Errorf("%s: expected string path, got %T", funcArtifactAttestation, a2.Value)
+	}
+
+	if inp.HTTP.Checksum == "" {
+		s.addUnknown(funcArtifactAttestation)
+		return nil, nil
+	}
+
+	dgst, err := digest.Parse(inp.HTTP.Checksum)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: invalid checksum", funcArtifactAttestation)
+	}
+
+	bundleBytes, err := p.readFile(string(path), 8*1024*1024)
+	if err != nil {
+		return nil, err
+	}
+
+	if p.opt.VerifierProvider == nil {
+		return nil, errors.Errorf("%s: policy verifier is not configured", funcArtifactAttestation)
+	}
+	v, err := p.opt.VerifierProvider()
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: getting policy verifier", funcArtifactAttestation)
+	}
+
+	siRaw, err := v.VerifyArtifact(bctx.Context, dgst, bundleBytes)
+	if err != nil {
+		return nil, nil
+	}
+
+	si := toAttestationSignature(siRaw)
+	astVal, err := ast.InterfaceToValue(si)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: failed converting verification result", funcArtifactAttestation)
+	}
+
+	return ast.NewTerm(astVal), nil
 }
 
 func (p *Policy) builtinPinImageImpl(_ rego.BuiltinContext, a1, a2 *ast.Term, s *state) (*ast.Term, error) {

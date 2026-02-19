@@ -288,6 +288,22 @@ func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicy
 	if err != nil {
 		return nil, nil, err
 	}
+
+	rtUnk := runtimeUnknownInputRefs(st)
+	if len(rtUnk) > 0 {
+		next := &gwpb.ResolveSourceMetaRequest{
+			Source:   req.Source.Source,
+			Platform: req.Platform,
+		}
+		if err := AddUnknownsWithLogger(p.opt.Log, next, rtUnk); err != nil {
+			return nil, nil, err
+		}
+		if next.Image != nil || next.Git != nil || hasHTTPUnknowns(rtUnk) {
+			p.log(logrus.InfoLevel, "policy decision for source %s: resolve missing fields %+v", sourceName(req), summarizeUnknownsForLog(rtUnk))
+			return nil, next, nil
+		}
+	}
+
 	if len(rs) == 0 {
 		return nil, nil, errors.Errorf("policy returned zero result")
 	}
@@ -780,6 +796,9 @@ func runtimeUnknownInputRefs(st *state) []string {
 	var out []string
 	if _, ok := st.Unknowns[funcVerifyGitSignature]; ok {
 		out = append(out, "git.commit")
+	}
+	if _, ok := st.Unknowns[funcArtifactAttestation]; ok {
+		out = append(out, "http.checksum")
 	}
 	return out
 }

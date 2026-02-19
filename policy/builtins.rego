@@ -21,3 +21,8 @@ docker_github_builder_signature(sig, repo) if {
 	sig.signer.runnerEnvironment == "github-hosted"
 	count(sig.timestamps) > 0
 }
+
+docker_github_builder_bundle(http, filename, repo) if {
+	sig := artifact_attestation(http, filename)
+	docker_github_builder_signature(sig, repo)
+}
