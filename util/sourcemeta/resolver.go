@@ -24,10 +24,12 @@ type gatewayResolver interface {
 type Resolver struct {
 	startOnce sync.Once
 	closeOnce sync.Once
+	openOnce  sync.Once
 	started   atomic.Bool
 	mu        sync.Mutex
 
 	ready   chan gatewayResolver
+	opened  chan struct{}
 	done    chan struct{}
 	openErr error
 	doneErr error
@@ -81,9 +83,10 @@ func NewResolver(c *client.Client, opts ...Option) *Resolver {
 
 func newWithRun(run func(context.Context, chan<- gatewayResolver) error) *Resolver {
 	return &Resolver{
-		ready: make(chan gatewayResolver, 1),
-		done:  make(chan struct{}),
-		run:   run,
+		ready:  make(chan gatewayResolver, 1),
+		opened: make(chan struct{}),
+		done:   make(chan struct{}),
+		run:    run,
 	}
 }
 
@@ -169,6 +172,9 @@ func (r *Resolver) open(ctx context.Context) (gatewayResolver, error) {
 			r.mu.Lock()
 			if r.metaResolver == nil {
 				r.metaResolver = mr
+				r.openOnce.Do(func() {
+					close(r.opened)
+				})
 			}
 			r.mu.Unlock()
 		case <-r.done:
@@ -179,8 +185,12 @@ func (r *Resolver) open(ctx context.Context) (gatewayResolver, error) {
 					err = errors.New("gateway build finished without a source metadata resolver")
 				}
 				r.openErr = err
+				r.openOnce.Do(func() {
+					close(r.opened)
+				})
 			}
 			r.mu.Unlock()
+		case <-r.opened:
 		case <-ctx.Done():
 			return nil, context.Cause(ctx)
 		}
