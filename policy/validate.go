@@ -39,6 +39,8 @@ type Policy struct {
 	denyIdentifiers map[string]struct{}
 }
 
+const maxResolveIterations = 10
+
 type state struct {
 	Input    Input
 	Unknowns map[string]struct{}
@@ -131,7 +133,7 @@ func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicy
 	if req.Source == nil || req.Source.Source == nil {
 		return nil, nil, errors.Errorf("no source info in request")
 	}
-	src := req.Source
+
 	var platform *ocispecs.Platform
 	if req.Platform != nil {
 		pl, err := platformFromReq(req)
@@ -143,17 +145,15 @@ func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicy
 		platform = p.opt.DefaultPlatform
 	}
 
-	inp, unknowns, err := SourceToInputWithLogger(ctx, p.opt.VerifierProvider, src, platform, p.opt.Log)
+	inp, err := SourceToInput(ctx, p.opt.VerifierProvider, req.Source, platform, p.opt.Log)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to convert source to policy input")
+		return nil, nil, errors.Wrap(err, "failed to build policy input")
 	}
-	inp.Env = p.opt.Env
 
 	caps := &ast.Capabilities{
 		Builtins: builtins(),
 		Features: slices.Clone(ast.Features),
 	}
-
 	comp := ast.NewCompiler().WithCapabilities(caps).WithKeepModules(true)
 	if p.opt.Log != nil {
 		comp = comp.WithEnablePrintStatements(true)
@@ -170,7 +170,6 @@ func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicy
 
 	var root fs.StatFS
 	var closeFS func() error
-
 	defer func() {
 		if closeFS != nil {
 			closeFS()
@@ -210,7 +209,6 @@ func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicy
 					if err != nil {
 						return nil, errors.Wrapf(err, "failed to parse imported policy file %s for module %s", fn, k)
 					}
-					// rewrite package to be less strict
 					pkgParts := strings.Split(pkgPath, ".")
 					ref := ast.Ref{mod.Package.Path[0]}
 					for _, p := range pkgParts {
@@ -224,155 +222,171 @@ func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicy
 		return out, nil
 	})
 
-	opts := []func(*rego.Rego){
+	baseOpts := []func(*rego.Rego){
 		rego.SetRegoVersion(ast.RegoV1),
 		rego.Query("data.docker.decision"),
-		rego.Input(inp),
 		rego.SkipPartialNamespace(true),
 		rego.Compiler(comp),
+		rego.Module(builtinPolicyModuleFilename, builtinPolicyModule),
 	}
 	if p.opt.Log != nil {
-		opts = append(opts,
+		baseOpts = append(baseOpts,
 			rego.EnablePrintStatements(true),
 			rego.PrintHook(p),
 		)
 	}
-	st := &state{
-		Input: inp,
-	}
-	for _, f := range p.funcs {
-		opts = append(opts, f.impl(st))
-	}
-
-	opts = append(opts, rego.Module(builtinPolicyModuleFilename, builtinPolicyModule))
 	for _, file := range p.opt.Files {
-		opts = append(opts, rego.Module(file.Filename, string(file.Data)))
+		baseOpts = append(baseOpts, rego.Module(file.Filename, string(file.Data)))
 	}
-	dt, err := json.MarshalIndent(inp, "", "  ")
-	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to marshal policy input")
-	}
+
 	p.log(logrus.InfoLevel, "checking policy for source %s", sourceName(req))
-	p.log(logrus.DebugLevel, "policy input: %s", dt)
 
-	if len(unknowns) > 0 {
-		p.log(logrus.DebugLevel, "unknowns for policy evaluation: %+v", unknowns)
-		opts = append(opts, rego.Unknowns(unknowns))
-	}
-	r := rego.New(opts...)
+	for range maxResolveIterations {
+		runInput := inp
+		applyEnvWithDepth(&runInput, p.opt.Env, 0)
 
-	if len(unknowns) > 0 {
-		pq, err := r.Partial(ctx)
+		runOpts := append([]func(*rego.Rego){}, baseOpts...)
+		runOpts = append(runOpts, rego.Input(runInput))
+
+		st := &state{Input: runInput}
+		for _, f := range p.funcs {
+			runOpts = append(runOpts, f.impl(st))
+		}
+
+		dt, err := json.MarshalIndent(runInput, "", "  ")
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to marshal policy input")
+		}
+		p.log(logrus.DebugLevel, "policy input: %s", dt)
+
+		unknowns := inp.Unknowns()
+		if len(unknowns) > 0 {
+			p.log(logrus.DebugLevel, "unknowns for policy evaluation: %+v", summarizeUnknownsForLog(unknowns))
+			runOpts = append(runOpts, rego.Unknowns(unknowns))
+		}
+		r := rego.New(runOpts...)
+
+		if len(unknowns) > 0 {
+			pq, err := r.Partial(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			unk := collectUnknowns(pq.Support, unknowns)
+			unk = append(unk, runtimeUnknownInputRefs(st)...)
+
+			retry, next, err := p.resolveUnknowns(ctx, &inp, req, platform, unk)
+			if err != nil {
+				return nil, nil, err
+			}
+			if next != nil {
+				return nil, next, nil
+			}
+			if retry {
+				continue
+			}
+		}
+
+		st.ImagePins = nil
+		rs, err := r.Eval(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		unk := collectUnknowns(pq.Support, unknowns)
-		unk = append(unk, runtimeUnknownInputRefs(st)...)
 
-		if len(unk) > 0 {
-			next := &gwpb.ResolveSourceMetaRequest{
-				Source:   req.Source.Source,
-				Platform: req.Platform,
-			}
-			if err := AddUnknownsWithLogger(p.opt.Log, next, unk); err != nil {
-				return nil, nil, err
-			}
-			if next.Image != nil || next.Git != nil || hasHTTPUnknowns(unk) {
-				p.log(logrus.InfoLevel, "policy decision for source %s: resolve missing fields %+v", sourceName(req), summarizeUnknownsForLog(unk))
-				return nil, next, nil
-			}
-		}
-	}
-
-	st.ImagePins = nil
-
-	rs, err := r.Eval(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	rtUnk := runtimeUnknownInputRefs(st)
-	if len(rtUnk) > 0 {
-		next := &gwpb.ResolveSourceMetaRequest{
-			Source:   req.Source.Source,
-			Platform: req.Platform,
-		}
-		if err := AddUnknownsWithLogger(p.opt.Log, next, rtUnk); err != nil {
+		retry, next, err := p.resolveUnknowns(ctx, &inp, req, platform, runtimeUnknownInputRefs(st))
+		if err != nil {
 			return nil, nil, err
 		}
-		if next.Image != nil || next.Git != nil || hasHTTPUnknowns(rtUnk) {
-			p.log(logrus.InfoLevel, "policy decision for source %s: resolve missing fields %+v", sourceName(req), summarizeUnknownsForLog(rtUnk))
+		if next != nil {
 			return nil, next, nil
 		}
-	}
-
-	if len(rs) == 0 {
-		return nil, nil, errors.Errorf("policy returned zero result")
-	}
-	rsz := rs[0]
-	if len(rsz.Expressions) == 0 {
-		return nil, nil, errors.Errorf("policy returned zero expressions")
-	}
-	v := rsz.Expressions[0].Value
-	vt, ok := v.(map[string]any)
-	if !ok {
-		return nil, nil, errors.Errorf("unexpected policy return type: %T %s", vt, rsz.Expressions[0].Text)
-	}
-
-	resp := &policysession.DecisionResponse{
-		Action: moby_buildkit_v1_sourcepolicy.PolicyAction_DENY,
-	}
-	p.log(logrus.DebugLevel, "policy response: %+v", vt)
-
-	if v, ok := vt["allow"]; ok {
-		if vv, ok := v.(bool); !ok {
-			return nil, nil, errors.Errorf("invalid allowed property type %T, expecting bool", v)
-		} else if vv {
-			resp.Action = moby_buildkit_v1_sourcepolicy.PolicyAction_ALLOW
+		if retry {
+			continue
 		}
-	}
 
-	if v, ok := vt["deny_msg"]; ok {
-		if vv, ok := v.([]any); ok {
-			for _, m := range vv {
-				if m, ok := m.(string); ok {
-					resp.DenyMessages = append(resp.DenyMessages, &policysession.DenyMessage{
-						Message: m,
-					})
+		if len(rs) == 0 {
+			return nil, nil, errors.Errorf("policy returned zero result")
+		}
+		rsz := rs[0]
+		if len(rsz.Expressions) == 0 {
+			return nil, nil, errors.Errorf("policy returned zero expressions")
+		}
+		v := rsz.Expressions[0].Value
+		vt, ok := v.(map[string]any)
+		if !ok {
+			return nil, nil, errors.Errorf("unexpected policy return type: %T %s", vt, rsz.Expressions[0].Text)
+		}
+
+		resp := &policysession.DecisionResponse{
+			Action: moby_buildkit_v1_sourcepolicy.PolicyAction_DENY,
+		}
+		p.log(logrus.DebugLevel, "policy response: %+v", vt)
+
+		if v, ok := vt["allow"]; ok {
+			if vv, ok := v.(bool); !ok {
+				return nil, nil, errors.Errorf("invalid allowed property type %T, expecting bool", v)
+			} else if vv {
+				resp.Action = moby_buildkit_v1_sourcepolicy.PolicyAction_ALLOW
+			}
+		}
+
+		if v, ok := vt["deny_msg"]; ok {
+			if vv, ok := v.([]any); ok {
+				for _, m := range vv {
+					if m, ok := m.(string); ok {
+						resp.DenyMessages = append(resp.DenyMessages, &policysession.DenyMessage{
+							Message: m,
+						})
+					}
 				}
 			}
 		}
-	}
 
-	if resp.Action == moby_buildkit_v1_sourcepolicy.PolicyAction_ALLOW {
-		if len(st.ImagePins) > 1 {
-			return nil, nil, errors.Errorf("multiple image pins set to %s: %v", sourceName(req), st.ImagePins)
-		}
-		if len(st.ImagePins) == 1 {
-			newSrc, err := addPinToImage(src.Source, slices.Collect(maps.Keys(st.ImagePins))[0])
-			if err != nil {
-				return nil, nil, errors.Wrapf(err, "failed to add image pin to source")
+		if resp.Action == moby_buildkit_v1_sourcepolicy.PolicyAction_ALLOW {
+			if len(st.ImagePins) > 1 {
+				return nil, nil, errors.Errorf("multiple image pins set to %s: %v", sourceName(req), st.ImagePins)
 			}
-			p.log(logrus.InfoLevel, "policy decision for source %s: convert to %s", sourceName(req), newSrc.Identifier)
+			if len(st.ImagePins) == 1 {
+				newSrc, err := addPinToImage(req.Source.Source, slices.Collect(maps.Keys(st.ImagePins))[0])
+				if err != nil {
+					return nil, nil, errors.Wrapf(err, "failed to add image pin to source")
+				}
+				p.log(logrus.InfoLevel, "policy decision for source %s: convert to %s", sourceName(req), newSrc.Identifier)
 
-			return &policysession.DecisionResponse{
-				Action: moby_buildkit_v1_sourcepolicy.PolicyAction_CONVERT,
-				Update: newSrc,
-			}, nil, nil
+				return &policysession.DecisionResponse{
+					Action: moby_buildkit_v1_sourcepolicy.PolicyAction_CONVERT,
+					Update: newSrc,
+				}, nil, nil
+			}
 		}
+
+		p.log(logrus.InfoLevel, "policy decision for source %s: %s", sourceName(req), resp.Action)
+		for _, dm := range resp.DenyMessages {
+			p.log(logrus.InfoLevel, " - %s", dm.Message)
+		}
+		if resp.Action == moby_buildkit_v1_sourcepolicy.PolicyAction_DENY {
+			p.recordDenyIdentifier(req)
+		}
+		return resp, nil, nil
 	}
 
-	p.log(logrus.InfoLevel, "policy decision for source %s: %s", sourceName(req), resp.Action)
-	for _, dm := range resp.DenyMessages {
-		p.log(logrus.InfoLevel, " - %s", dm.Message)
-	}
-	if resp.Action == moby_buildkit_v1_sourcepolicy.PolicyAction_DENY {
-		p.recordDenyIdentifier(req)
-	}
-
-	return resp, nil, nil
+	return nil, nil, errors.Errorf("maximum attempts reached for resolving policy metadata")
 }
 
+func (p *Policy) resolveUnknowns(ctx context.Context, input *Input, req *policysession.CheckPolicyRequest, defaultPlatform *ocispecs.Platform, unk []string) (bool, *gwpb.ResolveSourceMetaRequest, error) {
+	var resolver SourceMetadataResolver
+	if p.opt.SourceResolver != nil {
+		resolver = p.opt.SourceResolver
+	}
+	retry, next, err := ResolveInputUnknowns(ctx, input, req.Source.Source, unk, req.Platform, defaultPlatform, resolver, p.opt.VerifierProvider, p.opt.Log)
+	if err != nil {
+		return false, nil, err
+	}
+	if next != nil {
+		p.log(logrus.InfoLevel, "policy decision for source %s: resolve missing fields %+v", sourceName(req), summarizeUnknownsForLog(unk))
+		return false, next, nil
+	}
+	return retry, nil, nil
+}
 func platformFromReq(req *policysession.CheckPolicyRequest) (*ocispecs.Platform, error) {
 	if req.Platform != nil {
 		platformStr := req.Platform.OS + "/" + req.Platform.Architecture
@@ -404,11 +418,7 @@ func (p *Policy) Print(ctx print.Context, msg string) error {
 	return nil
 }
 
-func SourceToInput(ctx context.Context, getVerifier PolicyVerifierProvider, src *gwpb.ResolveSourceMetaResponse, platform *ocispecs.Platform) (Input, []string, error) {
-	return SourceToInputWithLogger(ctx, getVerifier, src, platform, nil)
-}
-
-func SourceToInputWithLogger(ctx context.Context, getVerifier PolicyVerifierProvider, src *gwpb.ResolveSourceMetaResponse, platform *ocispecs.Platform, logf func(logrus.Level, string)) (Input, []string, error) {
+func sourceToInput(ctx context.Context, getVerifier PolicyVerifierProvider, src *gwpb.ResolveSourceMetaResponse, platform *ocispecs.Platform, logf func(logrus.Level, string)) (Input, []string, error) {
 	var inp Input
 	var unknowns []string
 
@@ -625,7 +635,9 @@ func SourceToInputWithLogger(ctx context.Context, getVerifier PolicyVerifierProv
 				if err := json.Unmarshal(cfg, &img); err != nil {
 					return inp, nil, errors.Wrapf(err, "failed to unmarshal image config")
 				}
-				inp.Image.CreatedTime = img.Created.Format(time.RFC3339)
+				if img.Created != nil {
+					inp.Image.CreatedTime = img.Created.Format(time.RFC3339)
+				}
 				inp.Image.Labels = img.Config.Labels
 				inp.Image.Env = img.Config.Env
 				inp.Image.User = img.Config.User
@@ -639,7 +651,7 @@ func SourceToInputWithLogger(ctx context.Context, getVerifier PolicyVerifierProv
 			}
 
 			if ac := src.Image.AttestationChain; ac != nil {
-				if prv, err := parseProvenance(ac); err != nil {
+				if prv, err := parseProvenance(ac, logf); err != nil {
 					if logf != nil {
 						logf(logrus.DebugLevel, fmt.Sprintf("failed to parse image provenance: %v", err))
 					}
@@ -679,6 +691,20 @@ func withPrefix(arr []string, prefix string) []string {
 		out[i] = prefix + s
 	}
 	return out
+}
+
+func applyEnvWithDepth(inp *Input, env Env, depth int) {
+	if inp == nil {
+		return
+	}
+	inp.Env = env
+	inp.Env.Depth = depth
+	if inp.Image == nil || inp.Image.Provenance == nil || len(inp.Image.Provenance.Materials) == 0 {
+		return
+	}
+	for i := range inp.Image.Provenance.Materials {
+		applyEnvWithDepth(&inp.Image.Provenance.Materials[i], env, depth+1)
+	}
 }
 
 func AddUnknowns(req *gwpb.ResolveSourceMetaRequest, unk []string) error {
@@ -811,6 +837,7 @@ func summarizeUnknownsForLog(unk []string) []string {
 	out := make([]string, 0, len(unk))
 	seen := map[string]struct{}{}
 	for _, u := range unk {
+		u = strings.TrimPrefix(u, "input.")
 		if strings.HasPrefix(u, "image.signatures") {
 			u = "image.signatures"
 		}
@@ -849,6 +876,9 @@ func hasHTTPUnknowns(unk []string) bool {
 
 func trimKey(s string) string {
 	s = strings.TrimPrefix(s, "input.")
+	if strings.HasPrefix(s, "image.provenance.materials[") {
+		return s
+	}
 
 	const (
 		dot = '.'

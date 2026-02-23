@@ -158,12 +158,12 @@ func (r *policyTestOptionsProvider) Resolve(ctx context.Context, source *pb.Sour
 	if err := r.init(ctx); err != nil {
 		return nil, err
 	}
-	opt := sourceResolverOpt(req, r.platform)
+	opt := sourcemeta.ToResolverOpt(req, r.platform)
 	resp, err := r.metaResolver.ResolveSourceMetadata(ctx, source, opt)
 	if err != nil {
 		return nil, err
 	}
-	return buildSourceMetaResponse(resp), nil
+	return sourcemeta.ToGatewayMetaResponse(resp), nil
 }
 
 func (r *policyTestOptionsProvider) init(ctx context.Context) error {

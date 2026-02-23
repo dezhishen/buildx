@@ -3,6 +3,7 @@ package policy
 import (
 	"time"
 
+	slsa1 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v1"
 	"github.com/moby/buildkit/util/gitutil/gitobject"
 	policytypes "github.com/moby/policy-helpers/types"
 )
@@ -13,6 +14,8 @@ type Input struct {
 	Image *Image `json:"image,omitempty"`
 	HTTP  *HTTP  `json:"http,omitempty"`
 	Git   *Git   `json:"git,omitempty"`
+
+	unknowns []string `json:"-"`
 }
 
 type Decision struct {
@@ -25,6 +28,7 @@ type Env struct {
 	Labels   map[string]string  `json:"labels,omitempty"`
 	Filename string             `json:"filename,omitempty"`
 	Target   string             `json:"target,omitempty"`
+	Depth    int                `json:"depth"`
 }
 
 type HTTP struct {
@@ -149,6 +153,9 @@ type ImageProvenance struct {
 	Hermetic     *bool                        `json:"hermetic,omitempty"`
 
 	Completeness *ImageProvenanceCompleteness `json:"completeness,omitempty"`
+	Materials    []Input                      `json:"materials,omitempty"`
+
+	materialsRaw []slsa1.ResourceDescriptor `json:"-"`
 }
 
 type ImageProvenanceConfigSource struct {

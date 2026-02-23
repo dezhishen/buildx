@@ -23,7 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSourceToInputWithLogger(t *testing.T) {
+func TestSourceToInputSingleSource(t *testing.T) {
 	tm := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
 
 	tests := []struct {
@@ -866,7 +866,7 @@ func TestSourceToInputWithLogger(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			inp, unknowns, err := SourceToInputWithLogger(t.Context(), tc.verifier, tc.src, tc.platform, nil)
+			inp, unknowns, err := sourceToInput(t.Context(), tc.verifier, tc.src, tc.platform, nil)
 			if tc.assert != nil {
 				tc.assert(t, inp, unknowns, err)
 				return

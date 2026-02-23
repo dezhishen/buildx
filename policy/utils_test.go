@@ -29,6 +29,8 @@ func TestTrimKey(t *testing.T) {
 		{"git.tag[0]", "git.tag"},
 		{"input.git.tag.author", "git.tag"},
 		{"input.git.tag[0]", "git.tag"},
+		{"input.image.provenance.materials[0].image.hasProvenance", "image.provenance.materials[0].image.hasProvenance"},
+		{"image.provenance.materials[0].image.labels", "image.provenance.materials[0].image.labels"},
 
 		{"a.b.c", "a.b"},
 	}
@@ -46,16 +48,17 @@ func TestCollectUnknowns(t *testing.T) {
 		p if {
 			input.git.tag[0].author == "a"
 			input.image.signatures[_].signer.certificateIssuer != ""
+			input.image.provenance.materials[0].image.hasProvenance
 			data.foo.bar == 1
 		}
 	`)
 	require.NoError(t, err)
 
 	all := collectUnknowns([]*ast.Module{mod}, nil)
-	require.ElementsMatch(t, []string{"git.tag", "image.signatures"}, all)
+	require.ElementsMatch(t, []string{"git.tag", "image.signatures", "image.provenance.materials[0].image.hasProvenance"}, all)
 
-	filtered := collectUnknowns([]*ast.Module{mod}, []string{"input.image.signatures"})
-	require.Equal(t, []string{"image.signatures"}, filtered)
+	filtered := collectUnknowns([]*ast.Module{mod}, []string{"input.image.signatures", "input.image.provenance.materials[0].image.hasProvenance"})
+	require.ElementsMatch(t, []string{"image.signatures", "image.provenance.materials[0].image.hasProvenance"}, filtered)
 }
 
 func TestRuntimeUnknownInputRefs(t *testing.T) {
