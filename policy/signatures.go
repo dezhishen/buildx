@@ -22,6 +22,7 @@ import (
 
 type PolicyVerifier interface {
 	VerifyImage(context.Context, policyimage.ReferrersProvider, ocispecs.Descriptor, *ocispecs.Platform) (*policytypes.SignatureInfo, error)
+	VerifyArtifact(context.Context, digest.Digest, []byte, ...policyverifier.ArtifactVerifyOpt) (*policytypes.SignatureInfo, error)
 }
 
 type PolicyVerifierProvider func() (PolicyVerifier, error)
@@ -124,6 +125,14 @@ func parseSignatures(ctx context.Context, getVerifier PolicyVerifierProvider, ac
 		return nil, errors.Wrapf(err, "verifying image signatures")
 	}
 
+	return []AttestationSignature{toAttestationSignature(siRaw)}, nil
+}
+
+func toAttestationSignature(siRaw *policytypes.SignatureInfo) AttestationSignature {
+	if siRaw == nil {
+		return AttestationSignature{}
+	}
+
 	si := AttestationSignature{
 		raw:             siRaw,
 		Timestamps:      siRaw.Timestamps,
@@ -132,8 +141,6 @@ func parseSignatures(ctx context.Context, getVerifier PolicyVerifierProvider, ac
 		SignatureType:   toSignatureType(siRaw.SignatureType),
 		SignatureKind:   toSignatureKind(siRaw.Kind),
 	}
-
-	// TODO: signature type after upstream update
 
 	if siRaw.Signer != nil {
 		si.Signer = &SignerInfo{
@@ -157,7 +164,7 @@ func parseSignatures(ctx context.Context, getVerifier PolicyVerifierProvider, ac
 		}
 	}
 
-	return []AttestationSignature{si}, nil
+	return si
 }
 
 type acProvider struct {

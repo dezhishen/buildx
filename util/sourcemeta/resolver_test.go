@@ -8,27 +8,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
+	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/stretchr/testify/require"
 )
 
-type fakeMetaResolver struct {
-	calls atomic.Int32
-	resp  *sourceresolver.MetaResponse
-	err   error
+type fakeGatewayClient struct {
+	metaCalls  atomic.Int32
+	solveCalls atomic.Int32
+	metaResp   *sourceresolver.MetaResponse
+	metaErr    error
+	solveRes   *gwclient.Result
+	solveErr   error
 }
 
-func (f *fakeMetaResolver) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, opt sourceresolver.Opt) (*sourceresolver.MetaResponse, error) {
-	f.calls.Add(1)
-	return f.resp, f.err
+func (f *fakeGatewayClient) ResolveSourceMetadata(context.Context, *pb.SourceOp, sourceresolver.Opt) (*sourceresolver.MetaResponse, error) {
+	f.metaCalls.Add(1)
+	return f.metaResp, f.metaErr
+}
+
+func (f *fakeGatewayClient) Solve(context.Context, gwclient.SolveRequest) (*gwclient.Result, error) {
+	f.solveCalls.Add(1)
+	if f.solveRes == nil && f.solveErr == nil {
+		return nil, errors.New("unexpected solve call")
+	}
+	return f.solveRes, f.solveErr
 }
 
 func TestResolverCloseNoopBeforeResolve(t *testing.T) {
 	t.Parallel()
 
 	var called atomic.Int32
-	r := newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
+	r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
 		called.Add(1)
 		return nil
 	})
@@ -41,8 +54,8 @@ func TestResolverResolveOpensOnce(t *testing.T) {
 	t.Parallel()
 
 	var runs atomic.Int32
-	mr := &fakeMetaResolver{resp: &sourceresolver.MetaResponse{}}
-	r := newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
+	mr := &fakeGatewayClient{metaResp: &sourceresolver.MetaResponse{}}
+	r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
 		runs.Add(1)
 		ready <- mr
 		<-ctx.Done()
@@ -56,7 +69,7 @@ func TestResolverResolveOpensOnce(t *testing.T) {
 	require.NoError(t, err)
 
 	require.EqualValues(t, 1, runs.Load())
-	require.EqualValues(t, 2, mr.calls.Load())
+	require.EqualValues(t, 2, mr.metaCalls.Load())
 	require.NoError(t, r.Close())
 }
 
@@ -64,8 +77,8 @@ func TestResolverCloseAfterOpenCancelsBuild(t *testing.T) {
 	t.Parallel()
 
 	var canceled atomic.Bool
-	r := newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
-		ready <- &fakeMetaResolver{resp: &sourceresolver.MetaResponse{}}
+	r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
+		ready <- &fakeGatewayClient{metaResp: &sourceresolver.MetaResponse{}}
 		<-ctx.Done()
 		canceled.Store(true)
 		return context.Cause(ctx)
@@ -82,7 +95,7 @@ func TestResolverOpenFailureIsSticky(t *testing.T) {
 
 	expected := errors.New("boom")
 	var runs atomic.Int32
-	r := newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
+	r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
 		runs.Add(1)
 		return expected
 	})
@@ -108,7 +121,7 @@ func TestResolverCloseIgnoresTerminalContextErrors(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
+			r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
 				return tc.err
 			})
 			_, err := r.ResolveSourceMetadata(t.Context(), &pb.SourceOp{}, sourceresolver.Opt{})
@@ -122,8 +135,8 @@ func TestResolverConcurrentResolveUsesSingleOpen(t *testing.T) {
 	t.Parallel()
 
 	var runs atomic.Int32
-	mr := &fakeMetaResolver{resp: &sourceresolver.MetaResponse{}}
-	r := newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
+	mr := &fakeGatewayClient{metaResp: &sourceresolver.MetaResponse{}}
+	r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
 		runs.Add(1)
 		ready <- mr
 		<-ctx.Done()
@@ -148,7 +161,7 @@ func TestResolverConcurrentResolveUsesSingleOpen(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.EqualValues(t, 1, runs.Load())
-	require.EqualValues(t, n, mr.calls.Load())
+	require.EqualValues(t, n, mr.metaCalls.Load())
 
 	done := make(chan struct{})
 	closeErr := make(chan error, 1)
@@ -167,11 +180,11 @@ func TestResolverConcurrentResolveUsesSingleOpen(t *testing.T) {
 func TestResolverFirstCanceledContextDoesNotPoisonFutureCalls(t *testing.T) {
 	t.Parallel()
 
-	mr := &fakeMetaResolver{resp: &sourceresolver.MetaResponse{}}
+	mr := &fakeGatewayClient{metaResp: &sourceresolver.MetaResponse{}}
 	started := make(chan struct{})
 	release := make(chan struct{})
 
-	r := newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
+	r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
 		close(started)
 		<-release
 		ready <- mr
@@ -191,3 +204,23 @@ func TestResolverFirstCanceledContextDoesNotPoisonFutureCalls(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Close())
 }
+
+func TestResolverResolveStateUsesSolve(t *testing.T) {
+	t.Parallel()
+
+	mr := &fakeGatewayClient{solveErr: errors.New("solve boom")}
+	r := newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
+		ready <- mr
+		<-ctx.Done()
+		return context.Cause(ctx)
+	})
+
+	st := llb.Scratch()
+	_, err := r.ResolveState(t.Context(), st)
+	require.EqualError(t, err, "solve boom")
+	require.EqualValues(t, 1, mr.solveCalls.Load())
+	require.NoError(t, r.Close())
+}
+
+var _ gatewayResolver = (*fakeGatewayClient)(nil)
+var _ sourceresolver.MetaResolver = (*fakeGatewayClient)(nil)

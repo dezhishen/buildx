@@ -21,3 +21,19 @@ docker_github_builder_signature(sig, repo) if {
 	sig.signer.runnerEnvironment == "github-hosted"
 	count(sig.timestamps) > 0
 }
+
+docker_github_builder_bundle(http, filename, repo) if {
+	sig := artifact_attestation(http, filename)
+	docker_github_builder_signature(sig, repo)
+}
+
+github_release_attestation(http) := sig if {
+	http.schema == "https"
+	lower(http.host) == "github.com"
+
+	m := regex.find_all_string_submatch_n(`^/([^/]+)/([^/]+)/releases/download/[^/]+/.+$`, http.path, 1)[0]
+	owner := m[1]
+	repo := m[2]
+
+	sig := github_attestation(http, sprintf("%s/%s", [owner, repo]))
+}

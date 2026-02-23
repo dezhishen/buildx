@@ -6,7 +6,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/docker/buildx/util/progress"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
@@ -14,39 +16,77 @@ import (
 
 var _ sourceresolver.MetaResolver = &Resolver{}
 
+type gatewayResolver interface {
+	sourceresolver.MetaResolver
+	Solve(context.Context, gwclient.SolveRequest) (*gwclient.Result, error)
+}
+
 type Resolver struct {
 	startOnce sync.Once
 	closeOnce sync.Once
+	openOnce  sync.Once
 	started   atomic.Bool
 	mu        sync.Mutex
 
-	ready   chan sourceresolver.MetaResolver
+	ready   chan gatewayResolver
+	opened  chan struct{}
 	done    chan struct{}
 	openErr error
 	doneErr error
 	cancel  context.CancelCauseFunc
 
-	metaResolver sourceresolver.MetaResolver
-	run          func(context.Context, chan<- sourceresolver.MetaResolver) error
+	metaResolver gatewayResolver
+	run          func(context.Context, chan<- gatewayResolver) error
 	closeErr     error
 }
 
-func NewResolver(c *client.Client) *Resolver {
-	return newWithRun(func(ctx context.Context, ready chan<- sourceresolver.MetaResolver) error {
+type Option func(*newResolverOpts)
+
+type newResolverOpts struct {
+	progressWriter progress.Writer
+}
+
+func WithProgressWriter(pw progress.Writer) Option {
+	return func(o *newResolverOpts) {
+		o.progressWriter = pw
+	}
+}
+
+func NewResolver(c *client.Client, opts ...Option) *Resolver {
+	var cfg newResolverOpts
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
+	return newWithRun(func(ctx context.Context, ready chan<- gatewayResolver) error {
+		var (
+			statusChan chan *client.SolveStatus
+			done       chan struct{}
+		)
+		if cfg.progressWriter != nil {
+			statusChan, done = progress.NewChannel(progress.WithPrefix(cfg.progressWriter, "policy", false))
+			defer func() {
+				<-done
+			}()
+		}
+
 		_, err := c.Build(ctx, client.SolveOpt{Internal: true}, "buildx", func(ctx context.Context, gw gwclient.Client) (*gwclient.Result, error) {
 			ready <- gw
 			<-ctx.Done()
 			return nil, context.Cause(ctx)
-		}, nil)
+		}, statusChan)
 		return err
 	})
 }
 
-func newWithRun(run func(context.Context, chan<- sourceresolver.MetaResolver) error) *Resolver {
+func newWithRun(run func(context.Context, chan<- gatewayResolver) error) *Resolver {
 	return &Resolver{
-		ready: make(chan sourceresolver.MetaResolver, 1),
-		done:  make(chan struct{}),
-		run:   run,
+		ready:  make(chan gatewayResolver, 1),
+		opened: make(chan struct{}),
+		done:   make(chan struct{}),
+		run:    run,
 	}
 }
 
@@ -56,6 +96,31 @@ func (r *Resolver) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, o
 		return nil, err
 	}
 	return mr.ResolveSourceMetadata(ctx, op, opt)
+}
+
+func (r *Resolver) ResolveState(ctx context.Context, st llb.State) (gwclient.Reference, error) {
+	mr, err := r.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	def, err := st.Marshal(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := mr.Solve(ctx, gwclient.SolveRequest{
+		Definition: def.ToPB(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ref, err := res.SingleRef()
+	if err != nil {
+		return nil, err
+	}
+	return ref, nil
 }
 
 func (r *Resolver) Close() error {
@@ -76,7 +141,7 @@ func (r *Resolver) Close() error {
 	return r.closeErr
 }
 
-func (r *Resolver) open(ctx context.Context) (sourceresolver.MetaResolver, error) {
+func (r *Resolver) open(ctx context.Context) (gatewayResolver, error) {
 	r.startOnce.Do(func() {
 		r.started.Store(true)
 		buildCtx, cancel := context.WithCancelCause(context.Background())
@@ -107,6 +172,9 @@ func (r *Resolver) open(ctx context.Context) (sourceresolver.MetaResolver, error
 			r.mu.Lock()
 			if r.metaResolver == nil {
 				r.metaResolver = mr
+				r.openOnce.Do(func() {
+					close(r.opened)
+				})
 			}
 			r.mu.Unlock()
 		case <-r.done:
@@ -117,8 +185,12 @@ func (r *Resolver) open(ctx context.Context) (sourceresolver.MetaResolver, error
 					err = errors.New("gateway build finished without a source metadata resolver")
 				}
 				r.openErr = err
+				r.openOnce.Do(func() {
+					close(r.opened)
+				})
 			}
 			r.mu.Unlock()
+		case <-r.opened:
 		case <-ctx.Done():
 			return nil, context.Cause(ctx)
 		}

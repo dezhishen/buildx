@@ -5,6 +5,7 @@ import (
 	"crypto/sha1" //nolint:gosec // used for git object checksums in tests
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	slsa1 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v1"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/solver/pb"
+	policyverifier "github.com/moby/policy-helpers"
 	policyimage "github.com/moby/policy-helpers/image"
 	policytypes "github.com/moby/policy-helpers/types"
 	"github.com/opencontainers/go-digest"
@@ -896,11 +898,22 @@ func gitObjectSHA1(objType string, raw []byte) string {
 }
 
 type mockPolicyVerifier struct {
-	verifyImage func(context.Context, policyimage.ReferrersProvider, ocispecs.Descriptor, *ocispecs.Platform) (*policytypes.SignatureInfo, error)
+	verifyImage    func(context.Context, policyimage.ReferrersProvider, ocispecs.Descriptor, *ocispecs.Platform) (*policytypes.SignatureInfo, error)
+	verifyArtifact func(context.Context, digest.Digest, []byte, ...policyverifier.ArtifactVerifyOpt) (*policytypes.SignatureInfo, error)
 }
 
 func (m *mockPolicyVerifier) VerifyImage(ctx context.Context, provider policyimage.ReferrersProvider, desc ocispecs.Descriptor, platform *ocispecs.Platform) (*policytypes.SignatureInfo, error) {
+	if m.verifyImage == nil {
+		return nil, errors.New("unexpected VerifyImage call")
+	}
 	return m.verifyImage(ctx, provider, desc, platform)
+}
+
+func (m *mockPolicyVerifier) VerifyArtifact(ctx context.Context, dgst digest.Digest, bundle []byte, opts ...policyverifier.ArtifactVerifyOpt) (*policytypes.SignatureInfo, error) {
+	if m.verifyArtifact == nil {
+		return nil, errors.New("unexpected VerifyArtifact call")
+	}
+	return m.verifyArtifact(ctx, dgst, bundle, opts...)
 }
 
 func newTestAttestationChain(t *testing.T) *gwpb.AttestationChain {
