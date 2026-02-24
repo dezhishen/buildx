@@ -68,7 +68,7 @@ jobs:
       -
         name: Copy yaml
         run: |
-          cp /tmp/buildx-docs/out/reference/*.yaml ./data/buildx/
+          cp /tmp/buildx-docs/out/reference/*.yaml ./data/cli/buildx/
       -
         name: Update vendor
         run: |
