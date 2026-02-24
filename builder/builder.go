@@ -346,6 +346,7 @@ type CreateOpts struct {
 	Use                 bool
 	Endpoint            string
 	Append              bool
+	Timeout             time.Duration
 }
 
 func Create(ctx context.Context, txn *store.Txn, dockerCli command.Cli, opts CreateOpts) (*Builder, error) {
@@ -525,8 +526,10 @@ func Create(ctx context.Context, txn *store.Txn, dockerCli command.Cli, opts Cre
 		return nil, err
 	}
 
-	cancelCtx, cancel := context.WithCancelCause(ctx)
-	timeoutCtx, _ := context.WithTimeoutCause(cancelCtx, 20*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet // no need to manually cancel this context as we already rely on parent
+	timeoutCtx, cancel := context.WithCancelCause(ctx)
+	if opts.Timeout > 0 {
+		timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, opts.Timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet // no need to manually cancel this context as we already rely on parent
+	}
 	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	nodes, err := b.LoadNodes(timeoutCtx, WithData())
