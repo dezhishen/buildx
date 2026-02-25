@@ -118,6 +118,7 @@ func runEval(ctx context.Context, dockerCli command.Cli, source string, opts eva
 		var lastUnknowns []string
 		var trimmedUnknowns []string
 		var invalidFields []string
+		reloadedFields := map[string]struct{}{}
 		for {
 			maxAttempts--
 			if maxAttempts <= 0 {
@@ -133,6 +134,9 @@ func runEval(ctx context.Context, dockerCli command.Cli, source string, opts eva
 			}
 			lastUnknowns = slices.Clone(trimmedUnknowns)
 			toReload, invalid := selectReloadFields(opts.fields, trimmedUnknowns)
+			for _, f := range toReload {
+				reloadedFields[f] = struct{}{}
+			}
 			invalidFields = invalid
 			if len(toReload) > 0 {
 				retry, next, err := policy.ResolveInputUnknowns(ctx, &input, srcReq.Source, toReload, platform, &p, metaResolver, verifier, nil)
@@ -157,6 +161,7 @@ func runEval(ctx context.Context, dockerCli command.Cli, source string, opts eva
 			}
 			break
 		}
+		invalidFields = filterInvalidFields(invalidFields, reloadedFields)
 
 		if len(invalidFields) > 0 {
 			logrus.Warnf("invalid fields: %v", strings.Join(invalidFields, ", "))
@@ -290,6 +295,20 @@ func selectReloadFields(fields []string, unknowns []string) ([]string, []string)
 		invalid = append(invalid, field)
 	}
 	return slices.Collect(maps.Keys(reload)), invalid
+}
+
+func filterInvalidFields(invalid []string, reloadedFields map[string]struct{}) []string {
+	if len(invalid) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(invalid))
+	for _, field := range invalid {
+		if _, ok := reloadedFields[field]; ok {
+			continue
+		}
+		out = append(out, field)
+	}
+	return out
 }
 
 func findUnknownAncestor(field string, unknowns []string) string {

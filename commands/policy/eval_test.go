@@ -127,6 +127,19 @@ func TestSelectReloadFields(t *testing.T) {
 	})
 }
 
+func TestFilterInvalidFields(t *testing.T) {
+	out := filterInvalidFields([]string{
+		"git.tag",
+		"image.checksum",
+	}, map[string]struct{}{
+		"git.tag": {},
+	})
+	require.Equal(t, []string{"image.checksum"}, out)
+
+	out = filterInvalidFields([]string{"foo.bar"}, nil)
+	require.Equal(t, []string{"foo.bar"}, out)
+}
+
 func TestMaterialFieldPrerequisites(t *testing.T) {
 	t.Run("non material field", func(t *testing.T) {
 		prereq, ok := materialFieldPrerequisites("image.provenance")
