@@ -808,13 +808,40 @@ func collectUnknowns(mods []*ast.Module, allowed []string) []string {
 	}
 
 	filtered := make([]string, 0, len(out))
+	filteredSeen := map[string]struct{}{}
 	for _, k := range out {
-		if _, ok := valid[k]; ok {
-			filtered = append(filtered, k)
+		matched, ok := matchAllowedOrParent(k, valid)
+		if !ok {
+			continue
 		}
+		if _, exists := filteredSeen[matched]; exists {
+			continue
+		}
+		filteredSeen[matched] = struct{}{}
+		filtered = append(filtered, matched)
 	}
 
 	return filtered
+}
+
+func matchAllowedOrParent(key string, allowed map[string]struct{}) (string, bool) {
+	if _, ok := allowed[key]; ok {
+		return key, true
+	}
+	// Find the nearest parent on a component boundary.
+	for i := len(key) - 1; i >= 0; i-- {
+		switch key[i] {
+		case '.', '[':
+			if i == 0 {
+				continue
+			}
+			candidate := key[:i]
+			if _, ok := allowed[candidate]; ok {
+				return candidate, true
+			}
+		}
+	}
+	return "", false
 }
 
 func runtimeUnknownInputRefs(st *state) []string {

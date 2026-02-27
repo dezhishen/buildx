@@ -31,6 +31,9 @@ func TestTrimKey(t *testing.T) {
 		{"input.git.tag[0]", "git.tag"},
 		{"input.image.provenance.materials[0].image.hasProvenance", "image.provenance.materials[0].image.hasProvenance"},
 		{"image.provenance.materials[0].image.labels", "image.provenance.materials[0].image.labels"},
+		{"input.image.provenance.materials[0].image.provenance.predicateType", "image.provenance.materials[0].image.provenance.predicateType"},
+		{"input.image.provenance.materials[0].image.signatures[0].signer.certificateIssuer", "image.provenance.materials[0].image.signatures[0].signer.certificateIssuer"},
+		{"input.image.provenance.materials[10].image.hasProvenance", "image.provenance.materials[10].image.hasProvenance"},
 
 		{"a.b.c", "a.b"},
 	}
@@ -59,6 +62,47 @@ func TestCollectUnknowns(t *testing.T) {
 
 	filtered := collectUnknowns([]*ast.Module{mod}, []string{"input.image.signatures", "input.image.provenance.materials[0].image.hasProvenance"})
 	require.ElementsMatch(t, []string{"image.signatures", "image.provenance.materials[0].image.hasProvenance"}, filtered)
+}
+
+func TestCollectUnknownsParentAllowedMatchesChildRef(t *testing.T) {
+	mod, err := ast.ParseModule("x.rego", `
+		package x
+		p if {
+			input.image.provenance.materials[0].image.provenance.predicateType != ""
+			input.image.provenance.materials[0].image.signatures[0].signer.certificateIssuer != ""
+			input.image.provenance.materials[0].git.tag.name != ""
+			input.foo.bar != ""
+			input.image.provenance.materials[10].image.hasProvenance
+		}
+	`)
+	require.NoError(t, err)
+
+	filtered := collectUnknowns([]*ast.Module{mod}, []string{
+		"input.image.provenance.materials[0].image.provenance",
+		"input.image.provenance.materials[0].image.signatures",
+		"input.image.provenance.materials[0].git.tag",
+		"input.foo.b",
+		"input.image.provenance.materials[1].image",
+	})
+
+	require.ElementsMatch(t, []string{
+		"image.provenance.materials[0].image.provenance",
+		"image.provenance.materials[0].image.signatures",
+		"image.provenance.materials[0].git.tag",
+	}, filtered)
+}
+
+func TestMatchAllowedOrParentBoundary(t *testing.T) {
+	allowed := map[string]struct{}{
+		"foo.b":                               {},
+		"image.provenance.materials[1].image": {},
+	}
+
+	_, ok := matchAllowedOrParent("foo.bar", allowed)
+	require.False(t, ok)
+
+	_, ok = matchAllowedOrParent("image.provenance.materials[10].image.hasProvenance", allowed)
+	require.False(t, ok)
 }
 
 func TestRuntimeUnknownInputRefs(t *testing.T) {
