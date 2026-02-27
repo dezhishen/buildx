@@ -228,28 +228,48 @@ func normalizeLocalPolicyPath(name, contextDir string) string {
 
 type memoizedPolicyFS struct {
 	init    func() (fs.StatFS, func() error, error)
-	once    sync.Once
+	mu      sync.Mutex
+	loaded  bool
+	refs    int
 	fs      fs.StatFS
 	closeFn func() error
 	err     error
 }
 
 func (m *memoizedPolicyFS) get() (fs.StatFS, error) {
-	m.once.Do(func() {
-		if m.init == nil {
-			return
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.loaded {
+		m.loaded = true
+		if m.init != nil {
+			m.fs, m.closeFn, m.err = m.init()
 		}
-		m.fs, m.closeFn, m.err = m.init()
-	})
+	}
 	if m.err != nil {
 		return nil, m.err
 	}
+	m.refs++
 	return m.fs, nil
 }
 
 func (m *memoizedPolicyFS) close() error {
-	if m.closeFn != nil {
-		return m.closeFn()
+	m.mu.Lock()
+	if m.refs > 0 {
+		m.refs--
+	}
+	if m.refs > 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	closeFn := m.closeFn
+	m.fs = nil
+	m.closeFn = nil
+	m.err = nil
+	m.loaded = false
+	m.mu.Unlock()
+
+	if closeFn != nil {
+		return closeFn()
 	}
 	return nil
 }
