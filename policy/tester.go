@@ -454,7 +454,7 @@ func resolveTestInput(ctx context.Context, files []File, resolver *TestOptionsPr
 			return nil, false, err
 		}
 		if next == nil {
-			inp, _, err := SourceToInputWithLogger(ctx, resolver.VerifierProvider, srcReq, platform, nil)
+			inp, _, err := sourceToInput(ctx, resolver.VerifierProvider, srcReq, platform, nil)
 			if err != nil {
 				return nil, false, err
 			}

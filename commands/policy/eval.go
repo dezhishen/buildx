@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,7 +18,6 @@ import (
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/sourcemeta"
 	"github.com/docker/cli/cli/command"
-	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/frontend/dockerui"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/solver/pb"
@@ -27,7 +27,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type evalOpts struct {
@@ -111,60 +110,71 @@ func runEval(ctx context.Context, dockerCli command.Cli, source string, opts eva
 		srcReq := &gwpb.ResolveSourceMetaResponse{
 			Source: src,
 		}
+		input, err := policy.SourceToInput(ctx, verifier, srcReq, &p, nil)
+		if err != nil {
+			return err
+		}
 		maxAttempts := 5
-		var unknowns []string
 		var lastUnknowns []string
 		var trimmedUnknowns []string
-		var input policy.Input
-		var doneInvalidCheck bool
 		var invalidFields []string
+		reloadedFields := map[string]struct{}{}
 		for {
 			maxAttempts--
 			if maxAttempts <= 0 {
 				return errors.New("maximum attempts reached for resolving source metadata")
 			}
-			input, unknowns, err = policy.SourceToInput(ctx, verifier, srcReq, &p)
-			if err != nil {
-				return err
+			unknowns := input.Unknowns()
+			trimmedUnknowns = make([]string, 0, len(unknowns))
+			for _, u := range unknowns {
+				trimmedUnknowns = append(trimmedUnknowns, strings.TrimPrefix(u, "input."))
 			}
-			trimmedUnknowns = trimInputPrefixSlice(unknowns)
 			if lastUnknowns != nil && slices.Equal(trimmedUnknowns, lastUnknowns) {
 				break
 			}
 			lastUnknowns = slices.Clone(trimmedUnknowns)
-			toReload := []string{}
-			for _, f := range opts.fields {
-				if slices.Contains(trimmedUnknowns, f) {
-					toReload = append(toReload, f)
-				} else if !doneInvalidCheck {
-					invalidFields = append(invalidFields, f)
-				}
+			toReload, invalid := selectReloadFields(opts.fields, trimmedUnknowns)
+			for _, f := range toReload {
+				reloadedFields[f] = struct{}{}
 			}
-			doneInvalidCheck = true
+			invalidFields = invalid
 			if len(toReload) > 0 {
-				req := &gwpb.ResolveSourceMetaRequest{}
-				if err := policy.AddUnknowns(req, toReload); err != nil {
-					return err
-				}
-				opt := sourceResolverOpt(req, &p)
-				resp, err := metaResolver.ResolveSourceMetadata(ctx, src, opt)
+				retry, next, err := policy.ResolveInputUnknowns(ctx, &input, srcReq.Source, toReload, platform, &p, metaResolver, verifier, nil)
 				if err != nil {
 					return err
 				}
-				srcReq = buildSourceMetaResponse(resp)
-				continue
+				if next != nil {
+					resp, err := metaResolver.ResolveSourceMetadata(ctx, next.Source, sourcemeta.ToResolverOpt(next, &p))
+					if err != nil {
+						return err
+					}
+					srcReq = sourcemeta.ToGatewayMetaResponse(resp)
+					input, err = policy.SourceToInput(ctx, verifier, srcReq, &p, nil)
+					if err != nil {
+						return err
+					}
+					continue
+				}
+				if retry {
+					continue
+				}
 			}
 			break
 		}
+		invalidFields = filterInvalidFields(invalidFields, reloadedFields)
 
 		if len(invalidFields) > 0 {
 			logrus.Warnf("invalid fields: %v", strings.Join(invalidFields, ", "))
 		}
-		if len(trimmedUnknowns) > 0 {
-			logrus.Infof("unresolved fields: %v", strings.Join(trimmedUnknowns, ", "))
+		reportedUnknowns := summarizeEvalUnknowns(trimmedUnknowns, opts.fields)
+		if len(reportedUnknowns) > 0 {
+			logrus.Infof("unresolved fields: %v", strings.Join(reportedUnknowns, ", "))
 		}
 
-		dt, err := json.MarshalIndent(input, "", "  ")
+		printInput := input
+		sanitizePrintInput(&printInput)
+
+		dt, err := json.MarshalIndent(printInput, "", "  ")
 		if err != nil {
 			return errors.Wrap(err, "failed to marshal policy input")
 		}
@@ -198,6 +208,9 @@ func runEval(ctx context.Context, dockerCli command.Cli, source string, opts eva
 	env := policy.Env{
 		Filename: filepath.Base(policyName),
 	}
+	policyLog := func(_ logrus.Level, msg string) {
+		logrus.Debug(msg)
+	}
 
 	policyEval := policy.NewPolicy(policy.Opt{
 		Files: []policy.File{
@@ -207,9 +220,11 @@ func runEval(ctx context.Context, dockerCli command.Cli, source string, opts eva
 			},
 		},
 		Env:              env,
+		Log:              policyLog,
 		FS:               fsProvider,
 		VerifierProvider: verifier,
 		DefaultPlatform:  &p,
+		SourceResolver:   metaResolver,
 	})
 
 	srcReq := &gwpb.ResolveSourceMetaResponse{
@@ -233,114 +248,167 @@ func runEval(ctx context.Context, dockerCli command.Cli, source string, opts eva
 			return evalDecisionError(decision)
 		}
 
-		opt := sourceResolverOpt(next, &p)
-		resp, err := metaResolver.ResolveSourceMetadata(ctx, src, opt)
+		opt := sourcemeta.ToResolverOpt(next, &p)
+		target := src
+		if next.Source != nil {
+			target = next.Source
+		}
+		resp, err := metaResolver.ResolveSourceMetadata(ctx, target, opt)
 		if err != nil {
 			return err
 		}
-		srcReq = buildSourceMetaResponse(resp)
+		srcReq = sourcemeta.ToGatewayMetaResponse(resp)
 	}
 }
 
-func toGatewayDescriptor(desc ocispecs.Descriptor) *gwpb.Descriptor {
-	return &gwpb.Descriptor{
-		MediaType:   desc.MediaType,
-		Digest:      desc.Digest.String(),
-		Size:        desc.Size,
-		Annotations: desc.Annotations,
+func selectReloadFields(fields []string, unknowns []string) ([]string, []string) {
+	if len(fields) == 0 {
+		return nil, nil
 	}
+	reload := map[string]struct{}{}
+	var invalid []string
+	for _, field := range fields {
+		if prereq, ok := materialFieldPrerequisites(field); ok {
+			added := false
+			for _, p := range prereq {
+				if slices.Contains(unknowns, p) {
+					reload[p] = struct{}{}
+					added = true
+				}
+			}
+			if slices.Contains(unknowns, field) {
+				reload[field] = struct{}{}
+				added = true
+			} else if ancestor := findUnknownAncestor(field, unknowns); ancestor != "" {
+				reload[ancestor] = struct{}{}
+				added = true
+			}
+			if !added {
+				invalid = append(invalid, field)
+			}
+			continue
+		}
+		if slices.Contains(unknowns, field) {
+			reload[field] = struct{}{}
+			continue
+		}
+		invalid = append(invalid, field)
+	}
+	return slices.Collect(maps.Keys(reload)), invalid
 }
 
-func toGatewayAttestationChain(chain *sourceresolver.AttestationChain) *gwpb.AttestationChain {
-	if chain == nil {
+func filterInvalidFields(invalid []string, reloadedFields map[string]struct{}) []string {
+	if len(invalid) == 0 {
 		return nil
 	}
-	signatures := make([]string, 0, len(chain.SignatureManifests))
-	for _, dgst := range chain.SignatureManifests {
-		signatures = append(signatures, dgst.String())
-	}
-	blobs := make(map[string]*gwpb.Blob, len(chain.Blobs))
-	for dgst, blob := range chain.Blobs {
-		blobs[dgst.String()] = &gwpb.Blob{
-			Descriptor_: toGatewayDescriptor(blob.Descriptor),
-			Data:        blob.Data,
+	out := make([]string, 0, len(invalid))
+	for _, field := range invalid {
+		if _, ok := reloadedFields[field]; ok {
+			continue
 		}
-	}
-	return &gwpb.AttestationChain{
-		Root:                chain.Root.String(),
-		ImageManifest:       chain.ImageManifest.String(),
-		AttestationManifest: chain.AttestationManifest.String(),
-		SignatureManifests:  signatures,
-		Blobs:               blobs,
-	}
-}
-
-func sourceResolverOpt(req *gwpb.ResolveSourceMetaRequest, platform *ocispecs.Platform) sourceresolver.Opt {
-	opt := sourceresolver.Opt{
-		LogName:        req.LogName,
-		SourcePolicies: req.SourcePolicies,
-	}
-	if req.Image != nil {
-		opt.ImageOpt = &sourceresolver.ResolveImageOpt{
-			NoConfig:            req.Image.NoConfig,
-			AttestationChain:    req.Image.AttestationChain,
-			ResolveAttestations: slices.Clone(req.Image.ResolveAttestations),
-			Platform:            platform,
-			ResolveMode:         req.ResolveMode,
-		}
-	}
-	if req.Git != nil {
-		opt.GitOpt = &sourceresolver.ResolveGitOpt{
-			ReturnObject: req.Git.ReturnObject,
-		}
-	}
-	return opt
-}
-
-func buildSourceMetaResponse(resp *sourceresolver.MetaResponse) *gwpb.ResolveSourceMetaResponse {
-	out := &gwpb.ResolveSourceMetaResponse{
-		Source: resp.Op,
-	}
-	if resp.Image != nil {
-		chain := toGatewayAttestationChain(resp.Image.AttestationChain)
-		out.Image = &gwpb.ResolveSourceImageResponse{
-			Digest:           resp.Image.Digest.String(),
-			Config:           resp.Image.Config,
-			AttestationChain: chain,
-		}
-	}
-	if resp.Git != nil {
-		out.Git = &gwpb.ResolveSourceGitResponse{
-			Checksum:       resp.Git.Checksum,
-			Ref:            resp.Git.Ref,
-			CommitChecksum: resp.Git.CommitChecksum,
-			CommitObject:   resp.Git.CommitObject,
-			TagObject:      resp.Git.TagObject,
-		}
-	}
-	if resp.HTTP != nil {
-		var lastModified *timestamppb.Timestamp
-		if resp.HTTP.LastModified != nil {
-			lastModified = timestamppb.New(*resp.HTTP.LastModified)
-		}
-		out.HTTP = &gwpb.ResolveSourceHTTPResponse{
-			Checksum:     resp.HTTP.Digest.String(),
-			Filename:     resp.HTTP.Filename,
-			LastModified: lastModified,
-		}
+		out = append(out, field)
 	}
 	return out
 }
 
-func trimInputPrefixSlice(fields []string) []string {
-	if len(fields) == 0 {
-		return fields
+func findUnknownAncestor(field string, unknowns []string) string {
+	var best string
+	for _, unknown := range unknowns {
+		if field == unknown {
+			return unknown
+		}
+		if strings.HasPrefix(field, unknown+".") {
+			if len(unknown) > len(best) {
+				best = unknown
+			}
+			continue
+		}
+		if strings.HasPrefix(field, unknown+"[") {
+			if len(unknown) > len(best) {
+				best = unknown
+			}
+		}
 	}
-	out := make([]string, 0, len(fields))
-	for _, field := range fields {
-		out = append(out, strings.TrimPrefix(field, "input."))
+	return best
+}
+
+func materialFieldPrerequisites(field string) ([]string, bool) {
+	const seg = ".image.provenance.materials["
+	if !strings.HasPrefix(field, seg[1:]) {
+		return nil, false
 	}
-	return out
+	provenancePath := strings.TrimSuffix(seg, ".materials[")
+	out := map[string]struct{}{strings.TrimPrefix(provenancePath, "."): {}}
+	collectMaterialPrerequisites(field, seg, provenancePath, 0, out)
+	keys := slices.Collect(maps.Keys(out))
+	slices.Sort(keys)
+	return keys, true
+}
+
+func collectMaterialPrerequisites(field, seg, provenancePath string, start int, out map[string]struct{}) {
+	i := strings.Index(field[start:], seg)
+	if i < 0 {
+		return
+	}
+	i += start
+	out[field[:i]+provenancePath] = struct{}{}
+	collectMaterialPrerequisites(field, seg, provenancePath, i+len(seg), out)
+}
+
+func summarizeEvalUnknowns(unknowns, requested []string) []string {
+	if len(unknowns) == 0 {
+		return nil
+	}
+	if len(requested) > 0 {
+		out := map[string]struct{}{}
+		for _, field := range requested {
+			if slices.Contains(unknowns, field) {
+				out[field] = struct{}{}
+				continue
+			}
+			if ancestor := findUnknownAncestor(field, unknowns); ancestor != "" {
+				out[ancestor] = struct{}{}
+			}
+		}
+		keys := slices.Collect(maps.Keys(out))
+		slices.Sort(keys)
+		return keys
+	}
+
+	out := map[string]struct{}{}
+	for _, u := range unknowns {
+		out[summarizeUnknownField(u)] = struct{}{}
+	}
+	keys := slices.Collect(maps.Keys(out))
+	slices.Sort(keys)
+	return keys
+}
+
+func summarizeUnknownField(field string) string {
+	if base, _, ok := strings.Cut(field, ".materials["); ok {
+		return base + ".materials"
+	}
+	if strings.HasPrefix(field, "materials[") {
+		return "materials"
+	}
+	parts := strings.Split(field, ".")
+	if len(parts) > 1 {
+		return strings.Join(parts[:2], ".")
+	}
+	return field
+}
+
+func sanitizePrintInput(inp *policy.Input) {
+	if inp == nil {
+		return
+	}
+	inp.Env.Depth = 0
+	if inp.Image == nil || inp.Image.Provenance == nil || len(inp.Image.Provenance.Materials) == 0 {
+		return
+	}
+	for i := range inp.Image.Provenance.Materials {
+		sanitizePrintInput(&inp.Image.Provenance.Materials[i])
+	}
 }
 
 func evalDecisionError(decision *policysession.DecisionResponse) error {

@@ -2,6 +2,8 @@ package policy
 
 import (
 	"encoding/json"
+	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -10,6 +12,7 @@ import (
 	slsa1 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v1"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
+	"github.com/sirupsen/logrus"
 )
 
 const predicateTypeAnnotation = "in-toto.io/predicate-type"
@@ -24,12 +27,11 @@ type inTotoStatement struct {
 	Predicate     json.RawMessage `json:"predicate"`
 }
 
-func parseProvenance(ac *gwpb.AttestationChain) (*ImageProvenance, error) {
+func parseProvenance(ac *gwpb.AttestationChain, logf func(logrus.Level, string)) (*ImageProvenance, error) {
 	if ac == nil || len(ac.Blobs) == 0 {
 		return nil, nil
 	}
 
-	// Prefer blobs that explicitly declare a provenance predicate type.
 	for _, b := range ac.Blobs {
 		if b == nil || b.Descriptor_ == nil || len(b.Data) == 0 {
 			continue
@@ -41,7 +43,7 @@ func parseProvenance(ac *gwpb.AttestationChain) (*ImageProvenance, error) {
 		if !slices.Contains(resolveProvenanceAttestations, pt) {
 			continue
 		}
-		prv, err := parseProvenanceBlob(b.Data, pt)
+		prv, err := parseProvenanceBlob(b.Data, pt, logf)
 		if err != nil {
 			return nil, err
 		}
@@ -53,25 +55,30 @@ func parseProvenance(ac *gwpb.AttestationChain) (*ImageProvenance, error) {
 	return nil, nil
 }
 
-func parseProvenanceBlob(dt []byte, pt string) (*ImageProvenance, error) {
+func parseProvenanceBlob(dt []byte, pt string, logf func(logrus.Level, string)) (*ImageProvenance, error) {
 	var stmt inTotoStatement
-	if err := json.Unmarshal(dt, &stmt); err != nil || len(stmt.Predicate) == 0 {
+	if err := json.Unmarshal(dt, &stmt); err != nil {
 		return nil, nil
 	}
-	if stmt.PredicateType != "" && stmt.PredicateType != pt {
+	if len(stmt.Predicate) == 0 {
 		return nil, nil
 	}
 
-	switch pt {
-	case slsa1.PredicateSLSAProvenance:
-		return parseSLSA1Provenance(stmt.Predicate)
-	case slsa02.PredicateSLSAProvenance:
-		return parseSLSA02Provenance(stmt.Predicate)
+	predicateType := stmt.PredicateType
+	if predicateType == "" {
+		predicateType = pt
 	}
-	return nil, nil
+	switch predicateType {
+	case slsa1.PredicateSLSAProvenance:
+		return parseSLSA1Provenance(stmt.Predicate, logf)
+	case slsa02.PredicateSLSAProvenance:
+		return parseSLSA02Provenance(stmt.Predicate, logf)
+	default:
+		return nil, nil
+	}
 }
 
-func parseSLSA1Provenance(dt []byte) (*ImageProvenance, error) {
+func parseSLSA1Provenance(dt []byte, logf func(logrus.Level, string)) (*ImageProvenance, error) {
 	var pred provenancetypes.ProvenancePredicateSLSA1
 	if err := json.Unmarshal(dt, &pred); err != nil {
 		return nil, nil
@@ -92,6 +99,7 @@ func parseSLSA1Provenance(dt []byte) (*ImageProvenance, error) {
 		BuildArgs: extractBuildArgs(pred.BuildDefinition.ExternalParameters.Request.Args),
 		RawArgs:   pred.BuildDefinition.ExternalParameters.Request.Args,
 	}
+	prv.materialsRaw = rawMaterialsFromSLSA1(pred.BuildDefinition.ResolvedDependencies, logf)
 
 	if md := pred.RunDetails.Metadata; md != nil {
 		prv.InvocationID = md.InvocationID
@@ -108,7 +116,7 @@ func parseSLSA1Provenance(dt []byte) (*ImageProvenance, error) {
 	return prv, nil
 }
 
-func parseSLSA02Provenance(dt []byte) (*ImageProvenance, error) {
+func parseSLSA02Provenance(dt []byte, logf func(logrus.Level, string)) (*ImageProvenance, error) {
 	var pred provenancetypes.ProvenancePredicateSLSA02
 	if err := json.Unmarshal(dt, &pred); err != nil {
 		return nil, nil
@@ -129,6 +137,7 @@ func parseSLSA02Provenance(dt []byte) (*ImageProvenance, error) {
 		BuildArgs: extractBuildArgs(pred.Invocation.Parameters.Args),
 		RawArgs:   pred.Invocation.Parameters.Args,
 	}
+	prv.materialsRaw = rawMaterialsFromSLSA02(pred.Materials, logf)
 
 	if md := pred.Metadata; md != nil {
 		prv.InvocationID = md.BuildInvocationID
@@ -144,6 +153,48 @@ func parseSLSA02Provenance(dt []byte) (*ImageProvenance, error) {
 	}
 
 	return prv, nil
+}
+
+func rawMaterialsFromSLSA1(materials []slsa1.ResourceDescriptor, logf func(logrus.Level, string)) []slsa1.ResourceDescriptor {
+	if len(materials) == 0 {
+		return nil
+	}
+	out := make([]slsa1.ResourceDescriptor, 0, len(materials))
+	for _, m := range materials {
+		rd := slsa1.ResourceDescriptor{
+			URI:    m.URI,
+			Digest: maps.Clone(m.Digest),
+		}
+		if _, _, err := parseSLSAMaterial(rd); err != nil {
+			if logf != nil {
+				logf(logrus.WarnLevel, fmt.Sprintf("skipping unsupported provenance material %q: %v", m.URI, err))
+			}
+			continue
+		}
+		out = append(out, rd)
+	}
+	return out
+}
+
+func rawMaterialsFromSLSA02(materials []slsa02.ProvenanceMaterial, logf func(logrus.Level, string)) []slsa1.ResourceDescriptor {
+	if len(materials) == 0 {
+		return nil
+	}
+	out := make([]slsa1.ResourceDescriptor, 0, len(materials))
+	for _, m := range materials {
+		rd := slsa1.ResourceDescriptor{
+			URI:    m.URI,
+			Digest: maps.Clone(m.Digest),
+		}
+		if _, _, err := parseSLSAMaterial(rd); err != nil {
+			if logf != nil {
+				logf(logrus.WarnLevel, fmt.Sprintf("skipping unsupported provenance material %q: %v", m.URI, err))
+			}
+			continue
+		}
+		out = append(out, rd)
+	}
+	return out
 }
 
 func boolPtr(v bool) *bool {

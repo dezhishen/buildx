@@ -29,7 +29,7 @@ require (
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/in-toto/in-toto-golang v0.10.0
 	github.com/mitchellh/hashstructure/v2 v2.0.2
-	github.com/moby/buildkit v0.28.0-rc1
+	github.com/moby/buildkit v0.28.0-rc1.0.20260226174804-ecde33610015
 	github.com/moby/go-archive v0.2.0
 	github.com/moby/moby/api v1.53.0
 	github.com/moby/moby/client v0.2.2
@@ -183,6 +183,7 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
+	github.com/package-url/packageurl-go v0.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
