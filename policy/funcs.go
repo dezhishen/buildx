@@ -486,13 +486,15 @@ func (p *Policy) readFile(path string, limit int64) ([]byte, error) {
 	if p.opt.FS == nil {
 		return nil, errors.Errorf("no policy FS defined for reading context files")
 	}
-	fs, cf, err := p.opt.FS()
+	root, closeFS, err := p.opt.FS()
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get policy FS for reading context files")
 	}
-	defer cf()
+	if closeFS != nil {
+		defer closeFS()
+	}
 
-	f, err := fs.Open(path)
+	f, err := root.Open(path)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed opening file %q", path)
 	}
