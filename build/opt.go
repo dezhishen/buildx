@@ -7,7 +7,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -603,7 +602,7 @@ func configureSourcePolicy(ctx context.Context, np *noderesolver.ResolvedNode, o
 		}
 		env.Args[k] = &v
 	}
-	env.Filename = path.Base(opt.Inputs.DockerfilePath)
+	env.Filename = policyEnvFilename(opt.Inputs)
 	env.Target = opt.Target
 	env.Labels = opt.Labels
 
@@ -693,6 +692,14 @@ func configureSourcePolicy(ctx context.Context, np *noderesolver.ResolvedNode, o
 	}
 	so.SourcePolicyProvider = policysession.NewPolicyProvider(policy.MultiPolicyCallback(cbs...))
 	return defers, nil
+}
+
+func policyEnvFilename(inp Inputs) string {
+	base := filepath.Base(filepath.Clean(inp.DockerfilePath))
+	if base != "." && base != string(filepath.Separator) {
+		return base
+	}
+	return "Dockerfile"
 }
 
 func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw progress.Writer, target *client.SolveOpt) (func(), error) {
